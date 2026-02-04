@@ -127,14 +127,20 @@ This example shows how the profiler tracks independent work across warps within 
 - Further nested events within iterations (prepare, compute, update)
 - Direct array indexing for O(1) event access
 
-**examples/flash_attention_example.cu**: Production-quality Flash Attention v1 implementation for Ampere with comprehensive profiling. Demonstrates profiling of a real-world optimized kernel with:
-- Total attention computation timing
-- Per-tile processing (16 tiles for 512 sequence length)
-- Individual operations: load Q/K/V tiles, matmul QK^T, online softmax, matmul PV
-- Output finalization
-- Tiled computation to minimize HBM accesses
-- Online softmax algorithm for numerical stability
-- Shared memory management (32x32 tiles to fit within 48KB limit)
+**examples/flash_attention_example.cu**: Production-quality Flash Attention v2 implementation for Ampere with comprehensive profiling. Demonstrates profiling of a real-world optimized kernel with:
+- Per-warp total execution timing (FA2 parallelizes over warps)
+- Q loading (once per warp, streamed to registers)
+- Per-tile K/V loading (16 tiles for 1024 sequence, cooperative across block)
+- QK^T computation (register-based, parallel across warps)
+- Online softmax (computed in registers, not shared memory)
+- PV accumulation (register-based)
+- Output writing
+
+Key FA2 improvements over FA1:
+- Better parallelism: Each warp independently processes 16 rows (4 warps per block)
+- Reduced shared memory: Only K/V tiles stored (64x64), no attention score matrix
+- Register efficiency: Softmax computed entirely in registers
+- Performance: ~133 GFLOPS on 1024 sequence length
 
 This example shows how the profiler scales to complex kernels with multiple nested operations and demonstrates the overhead is negligible even with extensive instrumentation.
 

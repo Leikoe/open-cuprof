@@ -78,7 +78,7 @@ Each example generates a trace JSON file that you can view in:
 - **dgemm_example.cu**: Tensor core FP64 matrix multiplication using `mma.m8n8k4.f64`
 - **multi_warp_example.cu**: Demonstrates per-warp profiling with 4 warps doing different computational workloads
 - **nested_events_example.cu**: Shows hierarchical profiling with nested events (zero-overhead nesting)
-- **flash_attention_example.cu**: Production-quality Flash Attention kernel with tiled computation and online softmax
+- **flash_attention_example.cu**: Production-quality Flash Attention v2 kernel with warp-level parallelism and register-based softmax
 
 ## API Reference
 

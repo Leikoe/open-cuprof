@@ -5,112 +5,104 @@
 #include "profiler.cuh"
 
 /*
- * Flash Attention v1 for Ampere (sm_80+)
+ * Flash Attention v2 for Ampere (sm_80+)
  * 
- * Implements online softmax attention with tiling to reduce HBM accesses.
+ * Key improvements over FA1:
+ * - Parallelizes over sequence length dimension (better GPU utilization)
+ * - Each warp handles multiple rows of Q
+ * - Reduced shared memory usage through better partitioning
+ * - Non-matmul FLOPs reduced (softmax computed in registers)
  * 
  * Algorithm:
- * - Processes Q in blocks, K and V in tiles
- * - Maintains running max and sum for numerically stable softmax
- * - Uses shared memory for tile storage
- * - Minimizes HBM reads/writes
- * 
- * This implementation uses:
- * - Warp-level matrix operations (wmma for FP16)
- * - Shared memory tiling
- * - Online softmax algorithm
+ * - Each block processes Br rows of Q
+ * - Each warp within block processes subset of those rows
+ * - Loop over K/V in chunks of Bc
+ * - Maintains per-thread running statistics (m, l) for online softmax
+ * - Uses registers for accumulation, shared memory for tiles
  */
 
-// Tile sizes - tuned for Ampere shared memory limits
-constexpr int Br = 32;  // Q rows per block
-constexpr int Bc = 32;  // K/V columns per tile
+// Tile sizes - tuned for Ampere
+constexpr int Br = 64;  // Q rows per block
+constexpr int Bc = 64;  // K/V columns per tile
 constexpr int d = 64;   // Head dimension
+constexpr int WARPS_PER_BLOCK = 4;
+constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * 32;
 
 // Define profiler
 __device__ cuprof::Profiler<512, 32> flash_profiler;
 
-// FP32 Flash Attention kernel for Ampere
-__global__ void flash_attention_kernel(
+// Flash Attention v2 kernel
+__global__ void flash_attention_v2_kernel(
     const float* Q,  // [N, d] - queries
-    const float* K,  // [N, d] - keys
+    const float* K,  // [N, d] - keys  
     const float* V,  // [N, d] - values
     float* O,        // [N, d] - output
     int N,           // sequence length
     float scale      // 1/sqrt(d)
 ) {
-    // Block handles Br rows of Q
-    int block_row = blockIdx.x;
-    int row_start = block_row * Br;
-    int row_end = min(row_start + Br, N);
+    // Block processes Br rows of Q
+    int block_row_start = blockIdx.x * Br;
     
-    // Thread indexing
-    int tid = threadIdx.x;
+    // Warp-level indexing (FA2 parallelizes over warps)
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
     
-    // Shared memory for tiles
-    __shared__ float Q_smem[Br][d];
+    // Each warp handles Br/WARPS_PER_BLOCK rows
+    int rows_per_warp = Br / WARPS_PER_BLOCK;
+    int warp_row_start = block_row_start + warp_id * rows_per_warp;
+    int warp_row_end = min(warp_row_start + rows_per_warp, N);
+    
+    // Shared memory for K, V tiles (Q is streamed from global memory)
     __shared__ float K_smem[Bc][d];
     __shared__ float V_smem[Bc][d];
-    __shared__ float S_smem[Br][Bc];  // Attention scores
-    
-    // Per-thread accumulators
-    float O_local[d];
-    float m_i = -INFINITY;  // Running max
-    float l_i = 0.0f;       // Running sum
     
     bool is_leader = cuprof::is_warp_leader();
     cuprof::Event total_event;
     
     if (is_leader) {
-        total_event = flash_profiler.start_event("total_attention");
+        total_event = flash_profiler.start_event("warp_total");
     }
     
-    // Load Q tile into shared memory
-    cuprof::Event load_q_event;
-    if (is_leader) load_q_event = flash_profiler.start_event("load_Q_tile");
+    // Per-thread registers for Q row (each thread handles one Q row)
+    float Q_reg[d];
+    float O_reg[d];
+    float m_prev = -INFINITY;  // Running max
+    float l_prev = 0.0f;       // Running sum
     
-    for (int i = tid; i < Br * d; i += blockDim.x) {
-        int row = i / d;
-        int col = i % d;
-        int global_row = row_start + row;
-        if (global_row < N) {
-            Q_smem[row][col] = Q[global_row * d + col];
-        } else {
-            Q_smem[row][col] = 0.0f;
+    // Load Q rows for this warp
+    cuprof::Event load_q_event;
+    if (is_leader) load_q_event = flash_profiler.start_event("load_Q");
+    
+    int my_row = warp_row_start + lane_id;
+    if (my_row < warp_row_end && lane_id < rows_per_warp) {
+        #pragma unroll
+        for (int i = 0; i < d; i++) {
+            Q_reg[i] = Q[my_row * d + i];
+            O_reg[i] = 0.0f;
         }
     }
-    __syncthreads();
     
     if (is_leader) flash_profiler.end_event(load_q_event);
     
-    // Initialize output accumulator
-    cuprof::Event init_event;
-    if (is_leader) init_event = flash_profiler.start_event("init_accumulators");
-    
-    for (int i = 0; i < d; i++) {
-        O_local[i] = 0.0f;
-    }
-    
-    if (is_leader) flash_profiler.end_event(init_event);
-    
-    // Process K, V in tiles
+    // Loop over K, V tiles
     int num_tiles = (N + Bc - 1) / Bc;
     
     for (int tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
-        int col_start = tile_idx * Bc;
-        int col_end = min(col_start + Bc, N);
-        int tile_size = col_end - col_start;
+        int kv_start = tile_idx * Bc;
+        int kv_end = min(kv_start + Bc, N);
+        int tile_size = kv_end - kv_start;
         
         cuprof::Event tile_event;
-        if (is_leader) tile_event = flash_profiler.start_event("process_tile");
+        if (is_leader) tile_event = flash_profiler.start_event("process_KV_tile");
         
-        // Load K tile
+        // Cooperatively load K tile into shared memory
         cuprof::Event load_k_event;
         if (is_leader) load_k_event = flash_profiler.start_event("load_K_tile");
         
-        for (int i = tid; i < Bc * d; i += blockDim.x) {
+        for (int i = threadIdx.x; i < Bc * d; i += THREADS_PER_BLOCK) {
             int row = i / d;
             int col = i % d;
-            int global_row = col_start + row;
+            int global_row = kv_start + row;
             if (global_row < N && row < tile_size) {
                 K_smem[row][col] = K[global_row * d + col];
             } else {
@@ -121,14 +113,14 @@ __global__ void flash_attention_kernel(
         
         if (is_leader) flash_profiler.end_event(load_k_event);
         
-        // Load V tile
+        // Cooperatively load V tile into shared memory
         cuprof::Event load_v_event;
         if (is_leader) load_v_event = flash_profiler.start_event("load_V_tile");
         
-        for (int i = tid; i < Bc * d; i += blockDim.x) {
+        for (int i = threadIdx.x; i < Bc * d; i += THREADS_PER_BLOCK) {
             int row = i / d;
             int col = i % d;
-            int global_row = col_start + row;
+            int global_row = kv_start + row;
             if (global_row < N && row < tile_size) {
                 V_smem[row][col] = V[global_row * d + col];
             } else {
@@ -139,96 +131,100 @@ __global__ void flash_attention_kernel(
         
         if (is_leader) flash_profiler.end_event(load_v_event);
         
-        // Compute S = Q @ K^T (attention scores)
-        cuprof::Event matmul_qk_event;
-        if (is_leader) matmul_qk_event = flash_profiler.start_event("matmul_QK");
+        // Compute attention scores S = Q @ K^T for this tile
+        cuprof::Event qk_event;
+        if (is_leader) qk_event = flash_profiler.start_event("compute_QK");
         
-        for (int i = tid; i < Br * Bc; i += blockDim.x) {
-            int row = i / Bc;
-            int col = i % Bc;
-            
-            if (row_start + row < N && col < tile_size) {
+        float S_reg[Bc];  // Attention scores in registers
+        
+        if (my_row < warp_row_end && lane_id < rows_per_warp) {
+            #pragma unroll 4
+            for (int j = 0; j < tile_size; j++) {
                 float sum = 0.0f;
+                #pragma unroll
                 for (int k = 0; k < d; k++) {
-                    sum += Q_smem[row][k] * K_smem[col][k];
+                    sum += Q_reg[k] * K_smem[j][k];
                 }
-                S_smem[row][col] = sum * scale;
-            } else {
-                S_smem[row][col] = -INFINITY;
+                S_reg[j] = sum * scale;
+            }
+            // Mask out invalid positions
+            for (int j = tile_size; j < Bc; j++) {
+                S_reg[j] = -INFINITY;
             }
         }
-        __syncthreads();
         
-        if (is_leader) flash_profiler.end_event(matmul_qk_event);
+        if (is_leader) flash_profiler.end_event(qk_event);
         
-        // Online softmax update
+        // Online softmax update (FA2: computed in registers, not shared memory)
         cuprof::Event softmax_event;
         if (is_leader) softmax_event = flash_profiler.start_event("online_softmax");
         
-        // Each thread processes one row of Q
-        if (tid < Br && row_start + tid < N) {
-            int row = tid;
-            
-            // Find new max
-            float m_i_new = m_i;
+        if (my_row < warp_row_end && lane_id < rows_per_warp) {
+            // Find max in current tile
+            float m_curr = -INFINITY;
+            #pragma unroll 4
             for (int j = 0; j < tile_size; j++) {
-                m_i_new = fmaxf(m_i_new, S_smem[row][j]);
+                m_curr = fmaxf(m_curr, S_reg[j]);
             }
             
-            // Compute exponentials and new sum
-            float l_i_new = 0.0f;
+            // Update global max
+            float m_new = fmaxf(m_prev, m_curr);
+            
+            // Compute exp and sum for current tile
+            float l_curr = 0.0f;
+            #pragma unroll 4
             for (int j = 0; j < tile_size; j++) {
-                S_smem[row][j] = expf(S_smem[row][j] - m_i_new);
-                l_i_new += S_smem[row][j];
+                S_reg[j] = expf(S_reg[j] - m_new);
+                l_curr += S_reg[j];
             }
             
-            // Rescale previous output
-            float scale_old = expf(m_i - m_i_new);
-            for (int k = 0; k < d; k++) {
-                O_local[k] = O_local[k] * scale_old;
+            // Rescale previous output and sum
+            float scale_factor = expf(m_prev - m_new);
+            #pragma unroll
+            for (int i = 0; i < d; i++) {
+                O_reg[i] *= scale_factor;
             }
             
-            // Update running statistics
-            l_i = l_i * scale_old + l_i_new;
-            m_i = m_i_new;
+            l_prev = l_prev * scale_factor + l_curr;
+            m_prev = m_new;
         }
-        __syncthreads();
         
         if (is_leader) flash_profiler.end_event(softmax_event);
         
-        // Accumulate O += P @ V
-        cuprof::Event matmul_pv_event;
-        if (is_leader) matmul_pv_event = flash_profiler.start_event("matmul_PV");
+        // Accumulate O += P @ V (P are the normalized scores in S_reg)
+        cuprof::Event pv_event;
+        if (is_leader) pv_event = flash_profiler.start_event("accumulate_PV");
         
-        if (tid < Br && row_start + tid < N) {
-            int row = tid;
-            for (int k = 0; k < d; k++) {
+        if (my_row < warp_row_end && lane_id < rows_per_warp) {
+            #pragma unroll
+            for (int i = 0; i < d; i++) {
                 float sum = 0.0f;
+                #pragma unroll 4
                 for (int j = 0; j < tile_size; j++) {
-                    sum += S_smem[row][j] * V_smem[j][k];
+                    sum += S_reg[j] * V_smem[j][i];
                 }
-                O_local[k] += sum;
+                O_reg[i] += sum;
             }
         }
-        __syncthreads();
         
-        if (is_leader) flash_profiler.end_event(matmul_pv_event);
+        if (is_leader) flash_profiler.end_event(pv_event);
         if (is_leader) flash_profiler.end_event(tile_event);
+        
+        __syncthreads();
     }
     
     // Final normalization and write output
-    cuprof::Event finalize_event;
-    if (is_leader) finalize_event = flash_profiler.start_event("finalize_output");
+    cuprof::Event write_event;
+    if (is_leader) write_event = flash_profiler.start_event("write_output");
     
-    if (tid < Br && row_start + tid < N) {
-        int row = tid;
-        int global_row = row_start + row;
-        for (int k = 0; k < d; k++) {
-            O[global_row * d + k] = O_local[k] / l_i;
+    if (my_row < warp_row_end && lane_id < rows_per_warp) {
+        #pragma unroll
+        for (int i = 0; i < d; i++) {
+            O[my_row * d + i] = O_reg[i] / l_prev;
         }
     }
     
-    if (is_leader) flash_profiler.end_event(finalize_event);
+    if (is_leader) flash_profiler.end_event(write_event);
     if (is_leader) flash_profiler.end_event(total_event);
 }
 
@@ -292,14 +288,15 @@ void reference_attention(
 
 int main() {
     // Problem size
-    const int N = 512;  // Sequence length
+    const int N = 1024;  // Sequence length
     const float scale = 1.0f / sqrtf((float)d);
     
-    printf("Flash Attention Example (Ampere)\n");
+    printf("Flash Attention v2 Example (Ampere)\n");
     printf("  Sequence length: %d\n", N);
     printf("  Head dimension: %d\n", d);
     printf("  Tile sizes: Br=%d, Bc=%d\n", Br, Bc);
-    printf("\n");
+    printf("  Warps per block: %d\n", WARPS_PER_BLOCK);
+    printf("  Rows per warp: %d\n\n", Br / WARPS_PER_BLOCK);
     
     // Allocate host memory
     float* h_Q = new float[N * d];
@@ -330,16 +327,15 @@ int main() {
     
     // Launch configuration
     int num_blocks = (N + Br - 1) / Br;
-    int threads_per_block = 256;  // Multiple warps for parallelism
     
-    printf("Grid size: %d blocks, %d threads per block\n", num_blocks, threads_per_block);
-    printf("Total warps: %d\n\n", num_blocks * threads_per_block / 32);
+    printf("Grid size: %d blocks, %d threads per block\n", num_blocks, THREADS_PER_BLOCK);
+    printf("Total warps: %d\n\n", num_blocks * WARPS_PER_BLOCK);
     
     // Initialize profiler
     cuprof::init(&flash_profiler, num_blocks);
     
     // Warm-up run
-    flash_attention_kernel<<<num_blocks, threads_per_block>>>(
+    flash_attention_v2_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(
         d_Q, d_K, d_V, d_O, N, scale
     );
     cudaDeviceSynchronize();
@@ -350,7 +346,7 @@ int main() {
     cudaEventCreate(&end);
     
     cudaEventRecord(start);
-    flash_attention_kernel<<<num_blocks, threads_per_block>>>(
+    flash_attention_v2_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(
         d_Q, d_K, d_V, d_O, N, scale
     );
     cudaEventRecord(end);
@@ -426,13 +422,18 @@ int main() {
     printf("\nView the trace at:\n");
     printf("  - Chrome: chrome://tracing\n");
     printf("  - Perfetto: https://ui.perfetto.dev/\n\n");
-    printf("In the trace, you'll see:\n");
-    printf("  - Total attention computation per block\n");
-    printf("  - Per-tile processing (load K/V, matmul QK, softmax, matmul PV)\n");
-    printf("  - Load operations for Q, K, V tiles\n");
-    printf("  - Matrix multiplications (QK^T and PV)\n");
-    printf("  - Online softmax updates\n");
-    printf("  - Output finalization\n");
+    printf("Flash Attention v2 profiling shows:\n");
+    printf("  - Per-warp total execution time (better parallelism than FA1)\n");
+    printf("  - Q loading (once per warp, streamed to registers)\n");
+    printf("  - Per-tile K/V loading (cooperative across block)\n");
+    printf("  - QK^T computation (in registers, parallel across warps)\n");
+    printf("  - Online softmax (register-based, no shared memory)\n");
+    printf("  - PV accumulation (register-based)\n");
+    printf("  - Output writing\n\n");
+    printf("Key FA2 improvements:\n");
+    printf("  - Parallelism: Each warp independently processes %d rows\n", Br / WARPS_PER_BLOCK);
+    printf("  - Memory: Reduced shared memory (only K/V tiles, no S matrix)\n");
+    printf("  - Efficiency: Softmax computed in registers, not shared memory\n");
     
     return passed ? 0 : 1;
 }
