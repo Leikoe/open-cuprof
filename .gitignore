@@ -1,0 +1,20 @@
+# Build artifacts
+dgemm_example
+*.o
+*.a
+*.so
+*.cubin
+*.ptx
+
+# Profiler output
+*.json
+
+# Backup files
+*.bak
+*~
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
