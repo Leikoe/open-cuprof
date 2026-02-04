@@ -10,7 +10,9 @@
 
 // Helper to check if current thread is warp leader
 __device__ __forceinline__ bool profiler_is_warp_leader() {
-    return (threadIdx.x % 32) == 0;
+    unsigned int lane_id;
+    asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
+    return lane_id == 0;
 }
 
 
