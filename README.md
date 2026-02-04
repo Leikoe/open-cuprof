@@ -142,6 +142,22 @@ The profiler uses PTX special registers for minimal overhead:
 
 By using `%clock64` (per-SM cycle counter) combined with `%smid` for grouping, the profiler achieves high resolution timing (~0.4 ns at 2.5 GHz) while avoiding synchronization issues between different SMs.
 
+## Timing Assumptions and Limitations
+
+The profiler makes the following assumptions for accurate timing:
+
+1. **Constant clock rate**: `%clock64` runs at the GPU's base clock rate (queried via `cudaDevAttrClockRate`). GPU boost clocks or dynamic frequency scaling may affect accuracy.
+
+2. **Per-SM monotonicity**: `%clock64` is assumed to be monotonically increasing within each SM during kernel execution. Clock discontinuities are filtered by the 1-second sanity check.
+
+3. **Short kernel duration**: Events with durations > 1 second are assumed to be corrupted data and are clamped to 0. For very long-running kernels, consider alternative profiling methods.
+
+4. **Proper event pairing**: Each `start_event("name")` must be followed by `end_event("name")` with the exact same name string. Mismatched pairs will not be recorded.
+
+5. **Warp leader execution**: Profiling functions should only be called by the warp leader (lane 0). Use `profiler_is_warp_leader()` to check.
+
+6. **No wraparound**: The 64-bit `%clock64` counter wraps after ~233 years at 2.5 GHz, so wraparound within a kernel is not a concern for normal use cases.
+
 ## Example Output
 
 The Chrome Trace viewer will show:
