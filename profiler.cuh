@@ -8,20 +8,22 @@
 #include <unordered_map>
 #include <set>
 
+namespace cuprof {
+
 // Helper to check if current thread is warp leader
-__device__ __forceinline__ bool profiler_is_warp_leader() {
+__device__ __forceinline__ bool is_warp_leader() {
     unsigned int lane_id;
     asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
     return lane_id == 0;
 }
 
 
-// Event ID type for type safety and clarity
-struct EventId {
+// Event handle type for type safety and clarity
+struct Event {
     int id;
     
-    __device__ __host__ EventId() : id(-1) {}
-    __device__ __host__ explicit EventId(int i) : id(i) {}
+    __device__ __host__ Event() : id(-1) {}
+    __device__ __host__ explicit Event(int i) : id(i) {}
     __device__ __host__ bool is_valid() const { return id >= 0; }
 };
 
@@ -32,27 +34,27 @@ struct EventId {
  *
  * 1. Define a __device__ global profiler instance:
  *
- *      __device__ WarpProfiler<> myprofiler;
+ *      __device__ cuprof::Profiler<> myprofiler;
  *
  * 2. Host side - initialize:
  *
- *      profiler_init(&myprofiler, num_blocks);
+ *      cuprof::init(&myprofiler, num_blocks);
  *
  * 3. Device side - record events from warp leader only:
  *
- *      if (profiler_is_warp_leader()) {
- *          EventId id = myprofiler.start_event("compute");
+ *      if (cuprof::is_warp_leader()) {
+ *          cuprof::Event id = myprofiler.start_event("compute");
  *          // ... work ...
  *          myprofiler.end_event(id);
  *      }
  *
  * 4. Host side - export and cleanup:
  *
- *      profiler_export_and_cleanup(&myprofiler, "trace.json");
+ *      cuprof::export_and_cleanup(&myprofiler, "trace.json");
  */
 template <int MAX_EVENTS = 128, int MAX_WARPS = 32>
-struct __align__(16) WarpProfiler {
-    struct Event {
+struct __align__(16) Profiler {
+    struct EventData {
         uint64_t start_time;
         uint64_t end_time;
         const char* section_name;  // Pointer to device constant string
@@ -62,11 +64,11 @@ struct __align__(16) WarpProfiler {
     };
 
     // Per-warp event storage
-    Event events[MAX_WARPS][MAX_EVENTS];
+    EventData events[MAX_WARPS][MAX_EVENTS];
     int event_counts[MAX_WARPS];  // Number of events recorded per warp
 
     // Device pointer to per-block data
-    WarpProfiler *block_data;
+    Profiler *block_data;
     
     // Host-side storage for managing memory
     int num_blocks;
@@ -74,21 +76,21 @@ struct __align__(16) WarpProfiler {
     /**
      * @brief Start recording an event section. Call from warp leader only.
      * @param section_name Pointer to device constant string
-     * @return Event ID to pass to end_event() 
+     * @return Event handle to pass to end_event() 
      */
-    __device__ inline EventId start_event(const char* section_name) {
+    __device__ inline Event start_event(const char* section_name) {
         unsigned int block_id;
         asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(block_id));
         
-        WarpProfiler &block_profiler = block_data[block_id];
+        Profiler &block_profiler = block_data[block_id];
         
         unsigned int warp_id;
         asm volatile("mov.u32 %0, %%warpid;" : "=r"(warp_id));
         
-        if (warp_id >= MAX_WARPS) return EventId();
+        if (warp_id >= MAX_WARPS) return Event();
         
         int idx = block_profiler.event_counts[warp_id];
-        if (idx >= MAX_EVENTS) return EventId();  // Overflow protection
+        if (idx >= MAX_EVENTS) return Event();  // Overflow protection
         
         uint64_t timestamp;
         asm volatile("mov.u64 %0, %%clock64;" : "=l"(timestamp));
@@ -103,35 +105,35 @@ struct __align__(16) WarpProfiler {
         block_profiler.events[warp_id][idx].smid = smid;
         block_profiler.events[warp_id][idx].block_id = block_id;
         
-        // Increment counter and return the ID for this event
+        // Increment counter and return the handle for this event
         block_profiler.event_counts[warp_id]++;
-        return EventId(idx);
+        return Event(idx);
     }
 
     /**
      * @brief End recording an event section. Call from warp leader only.
-     * @param event_id Event ID returned by start_event()
+     * @param event Event handle returned by start_event()
      */
-    __device__ inline void end_event(EventId event_id) {
-        if (!event_id.is_valid()) return;  // Invalid event ID
+    __device__ inline void end_event(Event event) {
+        if (!event.is_valid()) return;  // Invalid event
         
         unsigned int block_id;
         asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(block_id));
         
-        WarpProfiler &block_profiler = block_data[block_id];
+        Profiler &block_profiler = block_data[block_id];
         
         unsigned int warp_id;
         asm volatile("mov.u32 %0, %%warpid;" : "=r"(warp_id));
         
         if (warp_id >= MAX_WARPS) return;
-        if (event_id.id >= MAX_EVENTS) return;
+        if (event.id >= MAX_EVENTS) return;
         
         uint64_t timestamp;
         asm volatile("mov.u64 %0, %%clock64;" : "=l"(timestamp));
         
-        // Directly access the event by ID - no search needed
-        block_profiler.events[warp_id][event_id.id].end_time = timestamp;
-        block_profiler.events[warp_id][event_id.id].valid = 1;
+        // Directly access the event by handle - no search needed
+        block_profiler.events[warp_id][event.id].end_time = timestamp;
+        block_profiler.events[warp_id][event.id].valid = 1;
     }
 
     /**
@@ -141,7 +143,7 @@ struct __align__(16) WarpProfiler {
      * @param filename Output JSON filename
      */
     static inline void export_chrome_trace(
-        const WarpProfiler *h_data, 
+        const Profiler *h_data, 
         int num_blocks, 
         const std::string &filename
     ) {
@@ -153,10 +155,10 @@ struct __align__(16) WarpProfiler {
         // Collect all unique section name pointers and retrieve their strings
         std::set<const char*> unique_name_ptrs;
         for (int block = 0; block < num_blocks; block++) {
-            const WarpProfiler &profiler = h_data[block];
+            const Profiler &profiler = h_data[block];
             for (int warp = 0; warp < MAX_WARPS; warp++) {
                 for (int evt = 0; evt < profiler.event_counts[warp]; evt++) {
-                    const Event &event = profiler.events[warp][evt];
+                    const EventData &event = profiler.events[warp][evt];
                     if (event.valid) {
                         unique_name_ptrs.insert(event.section_name);
                     }
@@ -198,10 +200,10 @@ struct __align__(16) WarpProfiler {
         // Find per-SM minimum start time (since clock64 is per-SM)
         std::unordered_map<unsigned int, uint64_t> sm_min_time;
         for (int block = 0; block < num_blocks; block++) {
-            const WarpProfiler &profiler = h_data[block];
+            const Profiler &profiler = h_data[block];
             for (int warp = 0; warp < MAX_WARPS; warp++) {
                 for (int evt = 0; evt < profiler.event_counts[warp]; evt++) {
-                    const Event &event = profiler.events[warp][evt];
+                    const EventData &event = profiler.events[warp][evt];
                     if (event.valid) {
                         if (sm_min_time.find(event.smid) == sm_min_time.end()) {
                             sm_min_time[event.smid] = event.start_time;
@@ -217,11 +219,11 @@ struct __align__(16) WarpProfiler {
         bool first_event = true;
 
         for (int block = 0; block < num_blocks; block++) {
-            const WarpProfiler &profiler = h_data[block];
+            const Profiler &profiler = h_data[block];
 
             for (int warp = 0; warp < MAX_WARPS; warp++) {
                 for (int evt = 0; evt < profiler.event_counts[warp]; evt++) {
-                    const Event &event = profiler.events[warp][evt];
+                    const EventData &event = profiler.events[warp][evt];
                     if (!event.valid) continue;
 
                     // Convert clock64 cycles to microseconds relative to per-SM start
@@ -274,24 +276,22 @@ struct __align__(16) WarpProfiler {
     }
 };
 
-// ===== FREE FUNCTIONS FOR PROFILER API =====
-
 /**
  * @brief Initialize a profiler instance. Allocates device memory for per-block data.
  * @param profiler Pointer to __device__ profiler instance
  * @param num_blocks Number of blocks that will be launched
  */
 template <int MAX_EVENTS, int MAX_WARPS>
-inline void profiler_init(WarpProfiler<MAX_EVENTS, MAX_WARPS> *profiler, int num_blocks) {
-    WarpProfiler<MAX_EVENTS, MAX_WARPS> h_profiler;
+inline void init(Profiler<MAX_EVENTS, MAX_WARPS> *profiler, int num_blocks) {
+    Profiler<MAX_EVENTS, MAX_WARPS> h_profiler;
     h_profiler.num_blocks = num_blocks;
     
     // Allocate device memory for per-block data
-    cudaMalloc(&h_profiler.block_data, num_blocks * sizeof(WarpProfiler<MAX_EVENTS, MAX_WARPS>));
-    cudaMemset(h_profiler.block_data, 0, num_blocks * sizeof(WarpProfiler<MAX_EVENTS, MAX_WARPS>));
+    cudaMalloc(&h_profiler.block_data, num_blocks * sizeof(Profiler<MAX_EVENTS, MAX_WARPS>));
+    cudaMemset(h_profiler.block_data, 0, num_blocks * sizeof(Profiler<MAX_EVENTS, MAX_WARPS>));
     
     // Copy the profiler struct to the __device__ global
-    cudaMemcpyToSymbol(*profiler, &h_profiler, sizeof(WarpProfiler<MAX_EVENTS, MAX_WARPS>));
+    cudaMemcpyToSymbol(*profiler, &h_profiler, sizeof(Profiler<MAX_EVENTS, MAX_WARPS>));
 }
 
 /**
@@ -300,26 +300,26 @@ inline void profiler_init(WarpProfiler<MAX_EVENTS, MAX_WARPS> *profiler, int num
  * @param filename Output JSON filename (empty string to skip export)
  */
 template <int MAX_EVENTS, int MAX_WARPS>
-inline void profiler_export_and_cleanup(
-    WarpProfiler<MAX_EVENTS, MAX_WARPS> *profiler,
+inline void export_and_cleanup(
+    Profiler<MAX_EVENTS, MAX_WARPS> *profiler,
     const std::string &filename = ""
 ) {
     // Copy profiler struct from device to host
-    WarpProfiler<MAX_EVENTS, MAX_WARPS> h_profiler;
-    cudaMemcpyFromSymbol(&h_profiler, *profiler, sizeof(WarpProfiler<MAX_EVENTS, MAX_WARPS>));
+    Profiler<MAX_EVENTS, MAX_WARPS> h_profiler;
+    cudaMemcpyFromSymbol(&h_profiler, *profiler, sizeof(Profiler<MAX_EVENTS, MAX_WARPS>));
     
     if (!h_profiler.block_data) return;
     
     // Copy per-block data from device to host
-    WarpProfiler<MAX_EVENTS, MAX_WARPS> *h_block_data = 
-        new WarpProfiler<MAX_EVENTS, MAX_WARPS>[h_profiler.num_blocks];
+    Profiler<MAX_EVENTS, MAX_WARPS> *h_block_data = 
+        new Profiler<MAX_EVENTS, MAX_WARPS>[h_profiler.num_blocks];
     cudaMemcpy(h_block_data, h_profiler.block_data, 
-               h_profiler.num_blocks * sizeof(WarpProfiler<MAX_EVENTS, MAX_WARPS>), 
+               h_profiler.num_blocks * sizeof(Profiler<MAX_EVENTS, MAX_WARPS>), 
                cudaMemcpyDeviceToHost);
     
     // Export if filename provided
     if (!filename.empty()) {
-        WarpProfiler<MAX_EVENTS, MAX_WARPS>::export_chrome_trace(
+        Profiler<MAX_EVENTS, MAX_WARPS>::export_chrome_trace(
             h_block_data, h_profiler.num_blocks, filename);
     }
     
@@ -327,3 +327,5 @@ inline void profiler_export_and_cleanup(
     delete[] h_block_data;
     cudaFree(h_profiler.block_data);
 }
+
+} // namespace cuprof

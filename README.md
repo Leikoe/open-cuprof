@@ -16,7 +16,7 @@ We extend these concepts with SM-based visualization, high-resolution `%clock64`
 ## Why open-cuprof?
 
 - **Low overhead**: Minimal instrumentation using PTX special registers (`%laneid`, `%warpid`, `%ctaid`, `%smid`, `%clock64`)
-- **Dead simple API**: Just `profiler.start_event("name")` and `profiler.end_event("name")`
+- **Dead simple API**: Just `profiler.start_event("name")` and `profiler.end_event(event)`
 - **No kernel signature changes**: Uses `__device__` globals - add profiling without modifying function signatures
 - **Multiple profilers**: Run multiple independent profiler instances simultaneously
 - **Per-warp profiling**: Track events independently for each warp
@@ -30,16 +30,16 @@ We extend these concepts with SM-based visualization, high-resolution `%clock64`
 #include "profiler.cuh"
 
 // Define profiler as __device__ global
-__device__ WarpProfiler<512, 1> myprofiler;
+__device__ cuprof::Profiler<512, 1> myprofiler;
 
 __global__ void my_kernel() {
     // Profile from warp leader only
-    if (profiler_is_warp_leader()) {
-        EventId compute_id = myprofiler.start_event("compute");
+    if (cuprof::is_warp_leader()) {
+        cuprof::Event compute_id = myprofiler.start_event("compute");
         // ... work ...
         myprofiler.end_event(compute_id);
         
-        EventId sync_id = myprofiler.start_event("sync");
+        cuprof::Event sync_id = myprofiler.start_event("sync");
         __syncthreads();
         myprofiler.end_event(sync_id);
     }
@@ -49,13 +49,13 @@ int main() {
     int num_blocks = 128;
     
     // Initialize profiler
-    profiler_init(&myprofiler, num_blocks);
+    cuprof::init(&myprofiler, num_blocks);
     
     // Run kernel (no signature changes needed!)
     my_kernel<<<num_blocks, 256>>>();
     
     // Export and cleanup
-    profiler_export_and_cleanup(&myprofiler, "trace.json");
+    cuprof::export_and_cleanup(&myprofiler, "trace.json");
 }
 ```
 
@@ -75,29 +75,30 @@ This will generate a `trace.json` file that you can view in:
 ### Device-side API
 
 **Methods** (call from warp leader only):
-- `EventId id = profiler.start_event("section_name")` - Start recording a section, returns event ID
-- `profiler.end_event(id)` - End recording a section using the event ID
+- `cuprof::Event id = profiler.start_event("section_name")` - Start recording a section, returns event handle
+- `profiler.end_event(id)` - End recording a section using the event handle
 
 **Helper**:
-- `profiler_is_warp_leader()` - Returns true if current thread is the warp leader (lane 0)
+- `cuprof::is_warp_leader()` - Returns true if current thread is the warp leader (lane 0)
 
 **Types**:
-- `EventId` - Opaque event identifier type. Default-constructed EventIds are invalid.
+- `cuprof::Event` - Event handle type. Default-constructed Events are invalid.
+- `cuprof::Profiler<MAX_EVENTS, MAX_WARPS>` - Main profiler class
 
-**Nesting**: Events can be nested by keeping track of event IDs. The profiler has zero overhead for nesting - no loops or searches, just direct array indexing.
+**Nesting**: Events can be nested by keeping track of event handles. The profiler has zero overhead for nesting - no loops or searches, just direct array indexing.
 
 String literals are automatically stored in device global memory and retrieved on the host.
 
 ### Host-side API
 
 **Functions**:
-- `profiler_init(&profiler, num_blocks)` - Initialize profiler and allocate device memory
-- `profiler_export_and_cleanup(&profiler, "trace.json")` - Export to Chrome Trace JSON and free memory
+- `cuprof::init(&profiler, num_blocks)` - Initialize profiler and allocate device memory
+- `cuprof::export_and_cleanup(&profiler, "trace.json")` - Export to Chrome Trace JSON and free memory
 
 ### Template Parameters
 
 ```cpp
-WarpProfiler<MAX_EVENTS, MAX_WARPS>
+cuprof::Profiler<MAX_EVENTS, MAX_WARPS>
 ```
 
 - `MAX_EVENTS`: Maximum events per warp per block (default: 128)

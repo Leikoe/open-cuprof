@@ -10,7 +10,7 @@
 #define N_ACC_PER_THREAD 2
 
 // Define the profiler as a __device__ global
-__device__ WarpProfiler<512, 1> myprofiler;
+__device__ cuprof::Profiler<512, 1> myprofiler;
 
 // TC DGEMM
 // requires: A row major, B col major, C row major.
@@ -38,11 +38,11 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
     }
 
     // Profile from warp leader (lane 0)
-    bool is_warp_leader = profiler_is_warp_leader();
+    bool is_warp_leader = cuprof::is_warp_leader();
 
     for (int block_k = 0; block_k < K / BK; block_k++) {
         // rA load
-        EventId load_a_id;
+        cuprof::Event load_a_id;
         if (is_warp_leader) load_a_id = myprofiler.start_event("load_A");
         {
             int m = block_m * BM + a_row;
@@ -52,7 +52,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
         if (is_warp_leader) myprofiler.end_event(load_a_id);
 
         // rB load
-        EventId load_b_id;
+        cuprof::Event load_b_id;
         if (is_warp_leader) load_b_id = myprofiler.start_event("load_B");
         {
             int k = block_k * BK + b_row;
@@ -62,7 +62,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
         if (is_warp_leader) myprofiler.end_event(load_b_id);
 
         // MMA instruction
-        EventId mma_id;
+        cuprof::Event mma_id;
         if (is_warp_leader) mma_id = myprofiler.start_event("mma");
         // instr doc: https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-mma
         asm volatile("mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%0, %1}, {%2}, {%3}, {%4, %5};"
@@ -73,7 +73,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
     }
 
     // Store results
-    EventId store_id;
+    cuprof::Event store_id;
     if (is_warp_leader) store_id = myprofiler.start_event("store_C");
     // indexing formulas from: https://docs.nvidia.com/cuda/parallel-thread-execution/#mma-884-c-f64
     {
@@ -99,7 +99,7 @@ int main() {
     int num_blocks = grid_size.x * grid_size.y;
 
     // Initialize profiler
-    profiler_init(&myprofiler, num_blocks);
+    cuprof::init(&myprofiler, num_blocks);
 
     // allocate host buffers
     double *a = (double *)malloc(sizeof(double) * M * K);
@@ -142,7 +142,7 @@ int main() {
     printf("%f GFlops\n", gflop / s);
 
     // Export profiler data
-    profiler_export_and_cleanup(&myprofiler, "trace.json");
+    cuprof::export_and_cleanup(&myprofiler, "trace.json");
     printf("Profiler trace exported to trace.json\n");
 
     // correctness check

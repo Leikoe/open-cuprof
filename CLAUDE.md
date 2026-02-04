@@ -49,32 +49,38 @@ Run examples:
 ### Core Components
 
 **profiler.cuh** (single header-only file):
-- `WarpProfiler<MAX_EVENTS, MAX_WARPS>` template struct: Main profiler implementation
+- Namespace: `cuprof` - All types and functions are in this namespace
+- `cuprof::Profiler<MAX_EVENTS, MAX_WARPS>` template struct: Main profiler implementation
   - `MAX_EVENTS`: Maximum events per warp per block (default: 128)
   - `MAX_WARPS`: Maximum warps to track per block (default: 32)
+- Types:
+  - `cuprof::Event` - Event handle returned by `start_event()` and passed to `end_event()`
+  - `cuprof::EventData` - Internal struct for storing event data
 - Device-side API: `start_event()`, `end_event()` called from warp leaders only
-- Host-side API: `profiler_init()`, `profiler_export_and_cleanup()`
-- Helper: `profiler_is_warp_leader()` - PTX-based check for lane 0
+- Host-side API: `cuprof::init()`, `cuprof::export_and_cleanup()`
+- Helper: `cuprof::is_warp_leader()` - PTX-based check for lane 0
 
 ### Key Design Patterns
 
 **Device Global Profilers**: Profilers are declared as `__device__` globals to avoid modifying kernel signatures:
 ```cpp
-__device__ WarpProfiler<512, 1> myprofiler;
+__device__ cuprof::Profiler<512, 1> myprofiler;
 ```
 
 **Per-Block Storage**: Each profiler maintains a `block_data` pointer to device memory allocated for all blocks. Device code uses `%ctaid.x` to index into per-block data.
 
 **String Literal Handling**: Section names are passed as `const char*` pointers to device constant strings. Export code reads these byte-by-byte from device memory to avoid over-reading.
 
-**Warp Leader Pattern**: Only the warp leader (lane 0) should call profiler methods to avoid redundant work:
+**Event Handle Pattern**: `start_event()` returns a `cuprof::Event` handle that must be passed to `end_event()`. This enables zero-overhead nested events through direct array indexing:
 ```cpp
-if (profiler_is_warp_leader()) {
-    myprofiler.start_event("section_name");
+if (cuprof::is_warp_leader()) {
+    cuprof::Event event = myprofiler.start_event("section_name");
     // ... work ...
-    myprofiler.end_event("section_name");
+    myprofiler.end_event(event);
 }
 ```
+
+**Warp Leader Pattern**: Only the warp leader (lane 0) should call profiler methods to avoid redundant work.
 
 **Chrome Trace Format**: Export uses the Trace Event Format with:
 - `pid` (process ID) = SM ID (shows actual hardware execution)
@@ -86,13 +92,13 @@ This visualization approach shows actual hardware utilization rather than logica
 
 ### Memory Management
 
-1. Host calls `profiler_init(&profiler, num_blocks)`:
-   - Allocates device memory for `num_blocks` worth of `WarpProfiler` instances
+1. Host calls `cuprof::init(&profiler, num_blocks)`:
+   - Allocates device memory for `num_blocks` worth of `cuprof::Profiler` instances
    - Uses `cudaMemcpyToSymbol` to copy profiler struct to `__device__` global
 
 2. Device code directly indexes into `block_data` array using block/warp IDs
 
-3. Host calls `profiler_export_and_cleanup(&profiler, "trace.json")`:
+3. Host calls `cuprof::export_and_cleanup(&profiler, "trace.json")`:
    - Uses `cudaMemcpyFromSymbol` to retrieve profiler struct
    - Copies all per-block data from device to host
    - Retrieves string literals byte-by-byte from device memory

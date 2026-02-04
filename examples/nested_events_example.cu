@@ -3,7 +3,7 @@
 #include "profiler.cuh"
 
 // Define the profiler as a __device__ global
-__device__ WarpProfiler<512, 4> myprofiler;
+__device__ cuprof::Profiler<512, 4> myprofiler;
 
 // Kernel demonstrating nested event profiling
 // This shows how to profile hierarchical operations:
@@ -18,30 +18,30 @@ __global__ void nested_events_kernel(
     int num_iterations
 ) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    bool is_warp_leader = profiler_is_warp_leader();
+    bool is_warp_leader = cuprof::is_warp_leader();
     
     if (tid >= n) return;
     
     float value = input[tid];
     
     // Profile the entire computation (outer event)
-    EventId total_id;
+    cuprof::Event total_id;
     if (is_warp_leader) total_id = myprofiler.start_event("total_computation");
     
     // Loop through iterations - each iteration is a nested scope
     for (int iter = 0; iter < num_iterations; iter++) {
         // Profile this iteration (nested within total_computation)
-        EventId iter_id;
+        cuprof::Event iter_id;
         if (is_warp_leader) iter_id = myprofiler.start_event("iteration");
         
         // Phase 1: Data preparation (nested within iteration)
-        EventId prep_id;
+        cuprof::Event prep_id;
         if (is_warp_leader) prep_id = myprofiler.start_event("prepare");
         float temp = value * 0.1f;
         if (is_warp_leader) myprofiler.end_event(prep_id);
         
         // Phase 2: Heavy computation (nested within iteration)
-        EventId comp_id;
+        cuprof::Event comp_id;
         if (is_warp_leader) comp_id = myprofiler.start_event("compute");
         #pragma unroll 1
         for (int i = 0; i < 20; i++) {
@@ -50,7 +50,7 @@ __global__ void nested_events_kernel(
         if (is_warp_leader) myprofiler.end_event(comp_id);
         
         // Phase 3: Update (nested within iteration)
-        EventId upd_id;
+        cuprof::Event upd_id;
         if (is_warp_leader) upd_id = myprofiler.start_event("update");
         value += temp;
         if (is_warp_leader) myprofiler.end_event(upd_id);
@@ -60,7 +60,7 @@ __global__ void nested_events_kernel(
     }
     
     // Final reduction phase (nested within total_computation)
-    EventId final_id;
+    cuprof::Event final_id;
     if (is_warp_leader) final_id = myprofiler.start_event("finalize");
     value = value / static_cast<float>(num_iterations);
     if (is_warp_leader) myprofiler.end_event(final_id);
@@ -84,7 +84,7 @@ int main() {
     printf("  Blocks: %d, Threads per block: %d\n\n", NUM_BLOCKS, THREADS_PER_BLOCK);
     
     // Initialize profiler
-    profiler_init(&myprofiler, NUM_BLOCKS);
+    cuprof::init(&myprofiler, NUM_BLOCKS);
     
     // Allocate host memory
     float *h_input = (float*)malloc(N * sizeof(float));
@@ -120,7 +120,7 @@ int main() {
     printf("Kernel execution time: %.3f ms\n", elapsed_ms);
     
     // Export profiler data
-    profiler_export_and_cleanup(&myprofiler, "nested_events_trace.json");
+    cuprof::export_and_cleanup(&myprofiler, "nested_events_trace.json");
     printf("Profiler trace exported to nested_events_trace.json\n\n");
     
     printf("View the trace at:\n");
