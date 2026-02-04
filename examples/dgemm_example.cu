@@ -9,15 +9,11 @@
 #define BK 4
 #define N_ACC_PER_THREAD 2
 
+// Define profiler section names
+
 // Define the profiler as a __device__ global
 // Use smaller event count since we only have 4 sections per iteration
 __device__ WarpProfiler<512, 1> myprofiler;  // 512 events, 1 warp (only profiling warp 0)
-
-// Section IDs for profiling
-#define SECTION_LOAD_A 0
-#define SECTION_LOAD_B 1
-#define SECTION_MMA 2
-#define SECTION_STORE_C 3
 
 // TC DGEMM
 // requires: A row major, B col major, C row major.
@@ -30,7 +26,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
 ) {
     int block_m = blockIdx.x;
     int block_n = blockIdx.y;
-
+    
     // Calculate linear block ID for profiling bounds check
     int linear_block_id = blockIdx.y * gridDim.x + blockIdx.x;
     bool should_profile = linear_block_id < num_blocks_to_profile;
@@ -55,35 +51,35 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
 
     for (int block_k = 0; block_k < K / BK; block_k++) {
         // rA load
-        if (do_profile) myprofiler.start_event(SECTION_LOAD_A);
+        if (do_profile) myprofiler.start_event("load_A");
         {
             int m = block_m * BM + a_row;
             int k = block_k * BK + a_col;
             rA = A[m * K + k];
         }
-        if (do_profile) myprofiler.end_event(SECTION_LOAD_A);
-
+        if (do_profile) myprofiler.end_event("load_A");
+        
         // rB load
-        if (do_profile) myprofiler.start_event(SECTION_LOAD_B);
+        if (do_profile) myprofiler.start_event("load_B");
         {
             int k = block_k * BK + b_row;
             int n = block_n * BN + b_col;
             rB = B[k * N + n];
         }
-        if (do_profile) myprofiler.end_event(SECTION_LOAD_B);
+        if (do_profile) myprofiler.end_event("load_B");
 
         // MMA instruction
-        if (do_profile) myprofiler.start_event(SECTION_MMA);
+        if (do_profile) myprofiler.start_event("mma");
         // instr doc: https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-mma
         asm volatile("mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%0, %1}, {%2}, {%3}, {%4, %5};"
                      : "=d"(rC[0]), "=d"(rC[1]) // outputs (the two accumulators)
                      : "d"(rA), "d"(rB), "d"(rC[0]), "d"(rC[1]) // inputs (a,b,c)
                      : "memory"); // hint that this instruction modifies memory
-        if (do_profile) myprofiler.end_event(SECTION_MMA);
+        if (do_profile) myprofiler.end_event("mma");
     }
 
     // Store results
-    if (do_profile) myprofiler.start_event(SECTION_STORE_C);
+    if (do_profile) myprofiler.start_event("store_C");
     // indexing formulas from: https://docs.nvidia.com/cuda/parallel-thread-execution/#mma-884-c-f64
     {
         int groupID = threadIdx.x / BK;
@@ -94,21 +90,21 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
             C[(block_m * BM + row) * N + (block_n * BN + col)] = rC[i];
         }
     }
-    if (do_profile) myprofiler.end_event(SECTION_STORE_C);
+    if (do_profile) myprofiler.end_event("store_C");
 }
 
 int main() {
     // init problem size, here we want to show a single tensor core call, so we use its size
-    int M = 512;
-    int N = 512;
-    int K = 512;
+    int M = 2048;
+    int N = 2048;
+    int K = 2048;
 
     // Calculate grid size
     dim3 grid_size(M / BM, N / BN);
-
+    
     // Only profile a subset of blocks to save memory (profile first 256 blocks)
     int num_blocks_to_profile = 256;
-
+    
     // Initialize profiler with limited blocks
     profiler_init(&myprofiler, num_blocks_to_profile);
 

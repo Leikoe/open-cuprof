@@ -5,29 +5,38 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <set>
+
 
 /**
  * @brief Lightweight per-warp profiler for CUDA kernels with Chrome Trace/Perfetto export.
  *
  * Usage:
  *
- * 1. Define a __device__ global profiler instance:
+ * 1. Define section names at global scope:
+ *
+ *      PROFILER_DEFINE_SECTION(mma);
+ *      PROFILER_DEFINE_SECTION(load_A);
+ *      PROFILER_DEFINE_SECTION(load_B);
+ *
+ * 2. Define a __device__ global profiler instance:
  *
  *      __device__ WarpProfiler<> myprofiler;
  *
- * 2. Host side - initialize:
+ * 3. Host side - initialize:
  *
  *      profiler_init(&myprofiler, num_blocks);
  *
- * 3. Device side - record events from warp leader only (using methods):
+ * 4. Device side - record events from warp leader only:
  *
- *      if (warp_leader_condition) {  // e.g., elect_one_sync()
- *          myprofiler.start_event(section_id);
+ *      if (warp_leader_condition) {
+ *          myprofiler.start_event("mma");
  *          // ... work ...
- *          myprofiler.end_event(section_id);
+ *          myprofiler.end_event("mma");
  *      }
  *
- * 4. Host side - export and cleanup:
+ * 5. Host side - export and cleanup:
  *
  *      profiler_export_and_cleanup(&myprofiler, "trace.json");
  */
@@ -36,7 +45,7 @@ struct __align__(16) WarpProfiler {
     struct Event {
         uint64_t start_time;
         uint64_t end_time;
-        int section_id;
+        const char* section_name;  // Pointer to device constant string
         int valid;  // 1 if event is valid, 0 otherwise
     };
 
@@ -52,9 +61,9 @@ struct __align__(16) WarpProfiler {
 
     /**
      * @brief Start recording an event section. Call from warp leader only.
-     * @param section_id User-defined section identifier
+     * @param section_name Pointer to device constant string 
      */
-    __device__ inline void start_event(int section_id) {
+    __device__ inline void start_event(const char* section_name) {
         unsigned int block_id;
         asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(block_id));
         
@@ -72,16 +81,16 @@ struct __align__(16) WarpProfiler {
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(timestamp));
         
         block_profiler.events[warp_id][idx].start_time = timestamp;
-        block_profiler.events[warp_id][idx].section_id = section_id;
+        block_profiler.events[warp_id][idx].section_name = section_name;
         block_profiler.events[warp_id][idx].end_time = 0;
         block_profiler.events[warp_id][idx].valid = 0;  // Not valid until ended
     }
 
     /**
      * @brief End recording an event section. Call from warp leader only.
-     * @param section_id User-defined section identifier (should match start)
+     * @param section_name Pointer to device constant string (should match start)
      */
-    __device__ inline void end_event(int section_id) {
+    __device__ inline void end_event(const char* section_name) {
         unsigned int block_id;
         asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(block_id));
         
@@ -99,7 +108,7 @@ struct __align__(16) WarpProfiler {
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(timestamp));
         
         // Verify this matches the current event being recorded
-        if (block_profiler.events[warp_id][idx].section_id == section_id) {
+        if (block_profiler.events[warp_id][idx].section_name == section_name) {
             block_profiler.events[warp_id][idx].end_time = timestamp;
             block_profiler.events[warp_id][idx].valid = 1;
             block_profiler.event_counts[warp_id]++;
@@ -138,6 +147,45 @@ struct __align__(16) WarpProfiler {
             return;
         }
 
+        // Collect all unique section name pointers and retrieve their strings
+        std::set<const char*> unique_name_ptrs;
+        for (int block = 0; block < num_blocks; block++) {
+            const WarpProfiler &profiler = h_data[block];
+            for (int warp = 0; warp < MAX_WARPS; warp++) {
+                for (int evt = 0; evt < profiler.event_counts[warp]; evt++) {
+                    const Event &event = profiler.events[warp][evt];
+                    if (event.valid) {
+                        unique_name_ptrs.insert(event.section_name);
+                    }
+                }
+            }
+        }
+
+        // Retrieve the actual strings from device constant memory
+        // Read byte-by-byte since we don't know the string length
+        std::unordered_map<const char*, std::string> name_map;
+        for (const char* dev_ptr : unique_name_ptrs) {
+            char buffer[256];
+            int len = 0;
+            for (int i = 0; i < 255; i++) {
+                cudaError_t err = cudaMemcpy(&buffer[i], dev_ptr + i, 1, cudaMemcpyDeviceToHost);
+                if (err != cudaSuccess || buffer[i] == '\0') {
+                    break;
+                }
+                len++;
+            }
+            buffer[len] = '\0';
+            
+            if (len > 0) {
+                name_map[dev_ptr] = std::string(buffer);
+            } else {
+                // Fallback to pointer address if reading fails
+                char addr_str[32];
+                snprintf(addr_str, sizeof(addr_str), "0x%llx", (unsigned long long)dev_ptr);
+                name_map[dev_ptr] = std::string(addr_str);
+            }
+        }
+
         // Find the global minimum start time across all events to use as base
         uint64_t global_min_time = UINT64_MAX;
         for (int block = 0; block < num_blocks; block++) {
@@ -172,16 +220,18 @@ struct __align__(16) WarpProfiler {
                     }
                     first_event = false;
 
+                    // Get the section name
+                    std::string section_name = name_map[event.section_name];
+
                     // Chrome Trace Event Format
                     out << "  {\n";
-                    out << "    \"name\": \"section_" << event.section_id << "\",\n";
+                    out << "    \"name\": \"" << section_name << "\",\n";
                     out << "    \"cat\": \"kernel\",\n";
                     out << "    \"ph\": \"X\",\n";  // Complete event (duration)
                     out << "    \"ts\": " << start_us << ",\n";
                     out << "    \"dur\": " << duration_us << ",\n";
                     out << "    \"pid\": " << block << ",\n";  // Process = block
-                    out << "    \"tid\": " << warp << ",\n";   // Thread = warp
-                    out << "    \"args\": {\"section_id\": " << event.section_id << "}\n";
+                    out << "    \"tid\": " << warp << "\n";   // Thread = warp
                     out << "  }";
                 }
             }
