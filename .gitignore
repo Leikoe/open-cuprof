@@ -2,6 +2,7 @@
 dgemm_example
 multi_warp_example
 nested_events_example
+flash_attention_example
 *.o
 *.a
 *.so

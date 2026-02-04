@@ -121,7 +121,24 @@ This visualization approach shows actual hardware utilization rather than logica
 
 This example shows how the profiler tracks independent work across warps within the same block. The different workloads produce measurable timing differences, making it easy to compare warp performance. When viewed in Chrome Trace, each warp appears as a separate thread (tid) within each block (pid), with clearly visible duration bars showing the relative cost of different operations.
 
-Both examples show profiling without kernel signature changes, using only warp leader checks.
+**examples/nested_events_example.cu**: Demonstrates hierarchical profiling with nested events. Shows zero-overhead nesting using event handles - no loops or searches needed. Features:
+- Outer event spanning entire computation
+- Inner events for each iteration
+- Further nested events within iterations (prepare, compute, update)
+- Direct array indexing for O(1) event access
+
+**examples/flash_attention_example.cu**: Production-quality Flash Attention v1 implementation for Ampere with comprehensive profiling. Demonstrates profiling of a real-world optimized kernel with:
+- Total attention computation timing
+- Per-tile processing (16 tiles for 512 sequence length)
+- Individual operations: load Q/K/V tiles, matmul QK^T, online softmax, matmul PV
+- Output finalization
+- Tiled computation to minimize HBM accesses
+- Online softmax algorithm for numerical stability
+- Shared memory management (32x32 tiles to fit within 48KB limit)
+
+This example shows how the profiler scales to complex kernels with multiple nested operations and demonstrates the overhead is negligible even with extensive instrumentation.
+
+All examples show profiling without kernel signature changes, using only warp leader checks.
 
 ## Modifying the Profiler
 

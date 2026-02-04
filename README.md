@@ -59,16 +59,26 @@ int main() {
 }
 ```
 
-## Building the Example
+## Building the Examples
 
 ```bash
-make
-./dgemm_example
+make                           # Build all examples
+./dgemm_example                # Tensor core DGEMM
+./multi_warp_example           # Multiple warps with different workloads
+./nested_events_example        # Nested event profiling
+./flash_attention_example      # Flash Attention implementation
 ```
 
-This will generate a `trace.json` file that you can view in:
+Each example generates a trace JSON file that you can view in:
 - **Chrome**: Navigate to `chrome://tracing` and load the file
 - **Perfetto**: Open https://ui.perfetto.dev/ and load the file
+
+### Examples Overview
+
+- **dgemm_example.cu**: Tensor core FP64 matrix multiplication using `mma.m8n8k4.f64`
+- **multi_warp_example.cu**: Demonstrates per-warp profiling with 4 warps doing different computational workloads
+- **nested_events_example.cu**: Shows hierarchical profiling with nested events (zero-overhead nesting)
+- **flash_attention_example.cu**: Production-quality Flash Attention kernel with tiled computation and online softmax
 
 ## API Reference
 
