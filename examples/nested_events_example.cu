@@ -25,23 +25,23 @@ __global__ void nested_events_kernel(
     float value = input[tid];
     
     // Profile the entire computation (outer event)
-    int total_id = -1;
+    EventId total_id;
     if (is_warp_leader) total_id = myprofiler.start_event("total_computation");
     
     // Loop through iterations - each iteration is a nested scope
     for (int iter = 0; iter < num_iterations; iter++) {
         // Profile this iteration (nested within total_computation)
-        int iter_id = -1;
+        EventId iter_id;
         if (is_warp_leader) iter_id = myprofiler.start_event("iteration");
         
         // Phase 1: Data preparation (nested within iteration)
-        int prep_id = -1;
+        EventId prep_id;
         if (is_warp_leader) prep_id = myprofiler.start_event("prepare");
         float temp = value * 0.1f;
         if (is_warp_leader) myprofiler.end_event(prep_id);
         
         // Phase 2: Heavy computation (nested within iteration)
-        int comp_id = -1;
+        EventId comp_id;
         if (is_warp_leader) comp_id = myprofiler.start_event("compute");
         #pragma unroll 1
         for (int i = 0; i < 20; i++) {
@@ -50,7 +50,7 @@ __global__ void nested_events_kernel(
         if (is_warp_leader) myprofiler.end_event(comp_id);
         
         // Phase 3: Update (nested within iteration)
-        int upd_id = -1;
+        EventId upd_id;
         if (is_warp_leader) upd_id = myprofiler.start_event("update");
         value += temp;
         if (is_warp_leader) myprofiler.end_event(upd_id);
@@ -60,7 +60,7 @@ __global__ void nested_events_kernel(
     }
     
     // Final reduction phase (nested within total_computation)
-    int final_id = -1;
+    EventId final_id;
     if (is_warp_leader) final_id = myprofiler.start_event("finalize");
     value = value / static_cast<float>(num_iterations);
     if (is_warp_leader) myprofiler.end_event(final_id);

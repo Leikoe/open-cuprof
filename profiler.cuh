@@ -16,34 +16,37 @@ __device__ __forceinline__ bool profiler_is_warp_leader() {
 }
 
 
+// Event ID type for type safety and clarity
+struct EventId {
+    int id;
+    
+    __device__ __host__ EventId() : id(-1) {}
+    __device__ __host__ explicit EventId(int i) : id(i) {}
+    __device__ __host__ bool is_valid() const { return id >= 0; }
+};
+
 /**
  * @brief Lightweight per-warp profiler for CUDA kernels with Chrome Trace/Perfetto export.
  *
  * Usage:
  *
- * 1. Define section names at global scope:
- *
- *      PROFILER_DEFINE_SECTION(mma);
- *      PROFILER_DEFINE_SECTION(load_A);
- *      PROFILER_DEFINE_SECTION(load_B);
- *
- * 2. Define a __device__ global profiler instance:
+ * 1. Define a __device__ global profiler instance:
  *
  *      __device__ WarpProfiler<> myprofiler;
  *
- * 3. Host side - initialize:
+ * 2. Host side - initialize:
  *
  *      profiler_init(&myprofiler, num_blocks);
  *
- * 4. Device side - record events from warp leader only:
+ * 3. Device side - record events from warp leader only:
  *
- *      if (warp_leader_condition) {
- *          myprofiler.start_event("mma");
+ *      if (profiler_is_warp_leader()) {
+ *          EventId id = myprofiler.start_event("compute");
  *          // ... work ...
- *          myprofiler.end_event("mma");
+ *          myprofiler.end_event(id);
  *      }
  *
- * 5. Host side - export and cleanup:
+ * 4. Host side - export and cleanup:
  *
  *      profiler_export_and_cleanup(&myprofiler, "trace.json");
  */
@@ -71,9 +74,9 @@ struct __align__(16) WarpProfiler {
     /**
      * @brief Start recording an event section. Call from warp leader only.
      * @param section_name Pointer to device constant string
-     * @return Event index to pass to end_event() 
+     * @return Event ID to pass to end_event() 
      */
-    __device__ inline int start_event(const char* section_name) {
+    __device__ inline EventId start_event(const char* section_name) {
         unsigned int block_id;
         asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(block_id));
         
@@ -82,10 +85,10 @@ struct __align__(16) WarpProfiler {
         unsigned int warp_id;
         asm volatile("mov.u32 %0, %%warpid;" : "=r"(warp_id));
         
-        if (warp_id >= MAX_WARPS) return -1;
+        if (warp_id >= MAX_WARPS) return EventId();
         
         int idx = block_profiler.event_counts[warp_id];
-        if (idx >= MAX_EVENTS) return -1;  // Overflow protection
+        if (idx >= MAX_EVENTS) return EventId();  // Overflow protection
         
         uint64_t timestamp;
         asm volatile("mov.u64 %0, %%clock64;" : "=l"(timestamp));
@@ -100,17 +103,17 @@ struct __align__(16) WarpProfiler {
         block_profiler.events[warp_id][idx].smid = smid;
         block_profiler.events[warp_id][idx].block_id = block_id;
         
-        // Increment counter and return the index for this event
+        // Increment counter and return the ID for this event
         block_profiler.event_counts[warp_id]++;
-        return idx;
+        return EventId(idx);
     }
 
     /**
      * @brief End recording an event section. Call from warp leader only.
-     * @param event_id Event index returned by start_event()
+     * @param event_id Event ID returned by start_event()
      */
-    __device__ inline void end_event(int event_id) {
-        if (event_id < 0) return;  // Invalid event ID
+    __device__ inline void end_event(EventId event_id) {
+        if (!event_id.is_valid()) return;  // Invalid event ID
         
         unsigned int block_id;
         asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(block_id));
@@ -121,14 +124,14 @@ struct __align__(16) WarpProfiler {
         asm volatile("mov.u32 %0, %%warpid;" : "=r"(warp_id));
         
         if (warp_id >= MAX_WARPS) return;
-        if (event_id >= MAX_EVENTS) return;
+        if (event_id.id >= MAX_EVENTS) return;
         
         uint64_t timestamp;
         asm volatile("mov.u64 %0, %%clock64;" : "=l"(timestamp));
         
         // Directly access the event by ID - no search needed
-        block_profiler.events[warp_id][event_id].end_time = timestamp;
-        block_profiler.events[warp_id][event_id].valid = 1;
+        block_profiler.events[warp_id][event_id.id].end_time = timestamp;
+        block_profiler.events[warp_id][event_id.id].valid = 1;
     }
 
     /**

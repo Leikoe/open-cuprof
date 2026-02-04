@@ -42,7 +42,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
 
     for (int block_k = 0; block_k < K / BK; block_k++) {
         // rA load
-        int load_a_id = -1;
+        EventId load_a_id;
         if (is_warp_leader) load_a_id = myprofiler.start_event("load_A");
         {
             int m = block_m * BM + a_row;
@@ -52,7 +52,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
         if (is_warp_leader) myprofiler.end_event(load_a_id);
 
         // rB load
-        int load_b_id = -1;
+        EventId load_b_id;
         if (is_warp_leader) load_b_id = myprofiler.start_event("load_B");
         {
             int k = block_k * BK + b_row;
@@ -62,7 +62,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
         if (is_warp_leader) myprofiler.end_event(load_b_id);
 
         // MMA instruction
-        int mma_id = -1;
+        EventId mma_id;
         if (is_warp_leader) mma_id = myprofiler.start_event("mma");
         // instr doc: https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-mma
         asm volatile("mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%0, %1}, {%2}, {%3}, {%4, %5};"
@@ -73,7 +73,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
     }
 
     // Store results
-    int store_id = -1;
+    EventId store_id;
     if (is_warp_leader) store_id = myprofiler.start_event("store_C");
     // indexing formulas from: https://docs.nvidia.com/cuda/parallel-thread-execution/#mma-884-c-f64
     {

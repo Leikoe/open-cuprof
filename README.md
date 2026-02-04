@@ -35,11 +35,11 @@ __device__ WarpProfiler<512, 1> myprofiler;
 __global__ void my_kernel() {
     // Profile from warp leader only
     if (profiler_is_warp_leader()) {
-        int compute_id = myprofiler.start_event("compute");
+        EventId compute_id = myprofiler.start_event("compute");
         // ... work ...
         myprofiler.end_event(compute_id);
         
-        int sync_id = myprofiler.start_event("sync");
+        EventId sync_id = myprofiler.start_event("sync");
         __syncthreads();
         myprofiler.end_event(sync_id);
     }
@@ -75,11 +75,14 @@ This will generate a `trace.json` file that you can view in:
 ### Device-side API
 
 **Methods** (call from warp leader only):
-- `int id = profiler.start_event("section_name")` - Start recording a section, returns event ID
+- `EventId id = profiler.start_event("section_name")` - Start recording a section, returns event ID
 - `profiler.end_event(id)` - End recording a section using the event ID
 
 **Helper**:
 - `profiler_is_warp_leader()` - Returns true if current thread is the warp leader (lane 0)
+
+**Types**:
+- `EventId` - Opaque event identifier type. Default-constructed EventIds are invalid.
 
 **Nesting**: Events can be nested by keeping track of event IDs. The profiler has zero overhead for nesting - no loops or searches, just direct array indexing.
 
