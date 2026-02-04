@@ -4,6 +4,15 @@ Lightweight single-file header-only profiler for CUDA kernels with Chrome Trace 
 
 > **Note**: This project was created with AI assistance (Claude Code).
 
+## Acknowledgments
+
+This profiler was inspired by and borrows architectural ideas from [ThunderKittens' profiler](https://github.com/HazyResearch/ThunderKittens/blob/78c6c446afa3faafdca1d12cf874cc3662ef77e8/include/pyutils/profiler.cuh), particularly:
+- Using PTX special registers for minimal overhead
+- Per-warp event tracking without modifying kernel signatures
+- Chrome Trace JSON export format
+
+We extend these concepts with SM-based visualization, high-resolution `%clock64` timing, and per-SM timestamp normalization.
+
 ## Why open-cuprof?
 
 - **Low overhead**: Minimal instrumentation using PTX special registers (`%laneid`, `%warpid`, `%ctaid`, `%smid`, `%clock64`)
