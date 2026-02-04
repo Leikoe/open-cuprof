@@ -38,7 +38,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
     }
 
     // Profile from warp leader (lane 0)
-    bool is_warp_leader = (threadIdx.x % 32) == 0;
+    bool is_warp_leader = profiler_is_warp_leader();
 
     for (int block_k = 0; block_k < K / BK; block_k++) {
         // rA load

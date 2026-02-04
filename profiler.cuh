@@ -8,6 +8,11 @@
 #include <unordered_map>
 #include <set>
 
+// Helper to check if current thread is warp leader
+__device__ __forceinline__ bool profiler_is_warp_leader() {
+    return (threadIdx.x % 32) == 0;
+}
+
 
 /**
  * @brief Lightweight per-warp profiler for CUDA kernels with Chrome Trace/Perfetto export.

@@ -23,7 +23,7 @@ __device__ WarpProfiler<512, 1> myprofiler;
 
 __global__ void my_kernel() {
     // Profile from warp leader only
-    if ((threadIdx.x % 32) == 0) {
+    if (profiler_is_warp_leader()) {
         myprofiler.start_event("mma");
         // ... work ...
         myprofiler.end_event("mma");
