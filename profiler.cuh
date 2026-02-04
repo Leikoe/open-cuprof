@@ -54,6 +54,8 @@ struct __align__(16) WarpProfiler {
         uint64_t end_time;
         const char* section_name;  // Pointer to device constant string
         int valid;  // 1 if event is valid, 0 otherwise
+        unsigned int smid;  // SM ID where this event was recorded
+        unsigned int block_id;  // Block ID for reference
     };
 
     // Per-warp event storage
@@ -85,12 +87,17 @@ struct __align__(16) WarpProfiler {
         if (idx >= MAX_EVENTS) return;  // Overflow protection
         
         uint64_t timestamp;
-        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(timestamp));
+        asm volatile("mov.u64 %0, %%clock64;" : "=l"(timestamp));
+        
+        unsigned int smid;
+        asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
         
         block_profiler.events[warp_id][idx].start_time = timestamp;
         block_profiler.events[warp_id][idx].section_name = section_name;
         block_profiler.events[warp_id][idx].end_time = 0;
         block_profiler.events[warp_id][idx].valid = 0;  // Not valid until ended
+        block_profiler.events[warp_id][idx].smid = smid;
+        block_profiler.events[warp_id][idx].block_id = block_id;
     }
 
     /**
@@ -112,7 +119,7 @@ struct __align__(16) WarpProfiler {
         if (idx >= MAX_EVENTS) return;
         
         uint64_t timestamp;
-        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(timestamp));
+        asm volatile("mov.u64 %0, %%clock64;" : "=l"(timestamp));
         
         // Verify this matches the current event being recorded
         if (block_profiler.events[warp_id][idx].section_name == section_name) {
@@ -123,31 +130,15 @@ struct __align__(16) WarpProfiler {
     }
 
     /**
-     * @brief Get the clock rate of the current GPU in kHz.
-     * @return Clock rate in kHz
-     */
-    static inline double get_gpu_clock_rate_khz() {
-        int device;
-        cudaGetDevice(&device);
-        
-        int clock_rate_khz;
-        cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate, device);
-        
-        return static_cast<double>(clock_rate_khz);
-    }
-
-    /**
      * @brief Export profiler data to Chrome Trace / Perfetto JSON format.
      * @param h_data Host profiler data array
      * @param num_blocks Number of blocks
      * @param filename Output JSON filename
-     * @param clock_rate_khz GPU clock rate in kHz
      */
     static inline void export_chrome_trace(
         const WarpProfiler *h_data, 
         int num_blocks, 
-        const std::string &filename,
-        double clock_rate_khz
+        const std::string &filename
     ) {
         std::ofstream out(filename);
         if (!out.is_open()) {
@@ -193,15 +184,25 @@ struct __align__(16) WarpProfiler {
             }
         }
 
-        // Find the global minimum start time across all events to use as base
-        uint64_t global_min_time = UINT64_MAX;
+        // Get GPU clock rate for cycle-to-time conversion
+        int device;
+        cudaGetDevice(&device);
+        int clock_rate_khz;
+        cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate, device);
+        
+        // Find per-SM minimum start time (since clock64 is per-SM)
+        std::unordered_map<unsigned int, uint64_t> sm_min_time;
         for (int block = 0; block < num_blocks; block++) {
             const WarpProfiler &profiler = h_data[block];
             for (int warp = 0; warp < MAX_WARPS; warp++) {
                 for (int evt = 0; evt < profiler.event_counts[warp]; evt++) {
                     const Event &event = profiler.events[warp][evt];
-                    if (event.valid && event.start_time < global_min_time) {
-                        global_min_time = event.start_time;
+                    if (event.valid) {
+                        if (sm_min_time.find(event.smid) == sm_min_time.end()) {
+                            sm_min_time[event.smid] = event.start_time;
+                        } else {
+                            sm_min_time[event.smid] = std::min(sm_min_time[event.smid], event.start_time);
+                        }
                     }
                 }
             }
@@ -218,9 +219,27 @@ struct __align__(16) WarpProfiler {
                     const Event &event = profiler.events[warp][evt];
                     if (!event.valid) continue;
 
-                    // Convert GPU timer ticks to microseconds relative to global start
-                    double start_us = static_cast<double>(event.start_time - global_min_time) / clock_rate_khz * 1000.0;
-                    double duration_us = static_cast<double>(event.end_time - event.start_time) / clock_rate_khz * 1000.0;
+                    // Convert clock64 cycles to microseconds relative to per-SM start
+                    // clock_rate_khz is in kHz, so cycles * 1000.0 / clock_rate_khz = microseconds
+                    uint64_t sm_base = sm_min_time[event.smid];
+                    double start_us = static_cast<double>(event.start_time - sm_base) * 1000.0 / clock_rate_khz;
+                    
+                    // Handle potential clock64 wraparound and sanity check
+                    // If end_time < start_time, the counter wrapped around
+                    double duration_us;
+                    if (event.end_time >= event.start_time) {
+                        uint64_t duration_cycles = event.end_time - event.start_time;
+                        duration_us = static_cast<double>(duration_cycles) * 1000.0 / clock_rate_khz;
+                        
+                        // Sanity check: if duration is unreasonably large (>1 second), likely corrupted data
+                        // This can happen if events aren't properly paired or clock64 has discontinuities
+                        if (duration_us > 1000000.0) {  // > 1 second
+                            duration_us = 0.0;
+                        }
+                    } else {
+                        // Wraparound occurred - duration would be negative, so clamp to 0
+                        duration_us = 0.0;
+                    }
 
                     if (!first_event) {
                         out << ",\n";
@@ -237,8 +256,9 @@ struct __align__(16) WarpProfiler {
                     out << "    \"ph\": \"X\",\n";  // Complete event (duration)
                     out << "    \"ts\": " << start_us << ",\n";
                     out << "    \"dur\": " << duration_us << ",\n";
-                    out << "    \"pid\": " << block << ",\n";  // Process = block
-                    out << "    \"tid\": " << warp << "\n";   // Thread = warp
+                    out << "    \"pid\": " << event.smid << ",\n";  // Process = SM
+                    out << "    \"tid\": " << warp << ",\n";   // Thread = warp
+                    out << "    \"args\": {\"block\": " << event.block_id << ", \"smid\": " << event.smid << "}\n";
                     out << "  }";
                 }
             }
@@ -273,13 +293,11 @@ inline void profiler_init(WarpProfiler<MAX_EVENTS, MAX_WARPS> *profiler, int num
  * @brief Export profiler data to Chrome Trace format and cleanup all memory.
  * @param profiler Pointer to __device__ profiler instance
  * @param filename Output JSON filename (empty string to skip export)
- * @param clock_rate_khz GPU clock rate in kHz (0 to auto-detect)
  */
 template <int MAX_EVENTS, int MAX_WARPS>
 inline void profiler_export_and_cleanup(
     WarpProfiler<MAX_EVENTS, MAX_WARPS> *profiler,
-    const std::string &filename = "",
-    double clock_rate_khz = 0.0
+    const std::string &filename = ""
 ) {
     // Copy profiler struct from device to host
     WarpProfiler<MAX_EVENTS, MAX_WARPS> h_profiler;
@@ -296,11 +314,8 @@ inline void profiler_export_and_cleanup(
     
     // Export if filename provided
     if (!filename.empty()) {
-        if (clock_rate_khz == 0.0) {
-            clock_rate_khz = WarpProfiler<MAX_EVENTS, MAX_WARPS>::get_gpu_clock_rate_khz();
-        }
         WarpProfiler<MAX_EVENTS, MAX_WARPS>::export_chrome_trace(
-            h_block_data, h_profiler.num_blocks, filename, clock_rate_khz);
+            h_block_data, h_profiler.num_blocks, filename);
     }
     
     // Cleanup

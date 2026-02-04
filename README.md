@@ -6,7 +6,7 @@ Lightweight single-file header-only profiler for CUDA kernels with Chrome Trace 
 
 ## Why open-cuprof?
 
-- **Low overhead**: Minimal instrumentation using PTX special registers (`%laneid`, `%warpid`, `%ctaid`, `%globaltimer`)
+- **Low overhead**: Minimal instrumentation using PTX special registers (`%laneid`, `%warpid`, `%ctaid`, `%smid`, `%clock64`)
 - **Dead simple API**: Just `profiler.start_event("name")` and `profiler.end_event("name")`
 - **No kernel signature changes**: Uses `__device__` globals - add profiling without modifying function signatures
 - **Multiple profilers**: Run multiple independent profiler instances simultaneously
@@ -120,7 +120,7 @@ profiler_export_and_cleanup(&memory_profiler, "memory.json");
 ## How It Works
 
 1. **Device-side**: String literals in CUDA device code are compiled into device global memory with stable addresses
-2. **Profiling**: The profiler stores pointers to these strings along with high-resolution timestamps from `%globaltimer`
+2. **Profiling**: The profiler stores pointers to these strings along with high-resolution timestamps from `%clock64` (SM cycle counter)
 3. **Export**: Strings are read byte-by-byte from device memory to avoid over-reading
 4. **Output**: Results are formatted as Chrome Trace Event Format JSON with human-readable section names
 
@@ -128,16 +128,24 @@ The profiler uses PTX special registers for minimal overhead:
 - `%laneid` - Lane ID within warp (0-31)
 - `%warpid` - Warp ID within block
 - `%ctaid.x` - Block ID in grid
-- `%globaltimer` - High-resolution GPU timer
+- `%smid` - SM (Streaming Multiprocessor) identifier
+- `%clock64` - High-resolution 64-bit SM cycle counter
+
+By using `%clock64` (per-SM cycle counter) combined with `%smid` for grouping, the profiler achieves high resolution timing (~0.4 ns at 2.5 GHz) while avoiding synchronization issues between different SMs.
 
 ## Example Output
 
 The Chrome Trace viewer will show:
-- **Process (pid)**: Each CUDA block
-- **Thread (tid)**: Each warp within the block
+- **Process (pid)**: Each SM (Streaming Multiprocessor) - shows actual hardware execution
+- **Thread (tid)**: Each warp within the SM
 - **Events**: Duration bars with your custom section names
+- **Args**: Additional metadata including block ID and SM ID
 
-This makes it easy to visualize per-warp timing and identify bottlenecks.
+This visualization makes it easy to:
+- See actual hardware utilization across SMs
+- Identify load imbalancing between SMs
+- Visualize per-warp timing within each SM
+- Understand how blocks are scheduled to hardware
 
 ## License
 

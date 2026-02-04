@@ -49,7 +49,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
             rA = A[m * K + k];
         }
         if (is_warp_leader) myprofiler.end_event("load_A");
-        
+
         // rB load
         if (is_warp_leader) myprofiler.start_event("load_B");
         {
@@ -86,14 +86,14 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
 
 int main() {
     // init problem size
-    int M = 1024;
-    int N = 1024;
-    int K = 1024;
+    int M = 256;
+    int N = 256;
+    int K = 256;
 
     // Calculate grid size
     dim3 grid_size(M / BM, N / BN);
     int num_blocks = grid_size.x * grid_size.y;
-    
+
     // Initialize profiler
     profiler_init(&myprofiler, num_blocks);
 

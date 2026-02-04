@@ -1,5 +1,6 @@
 # Build artifacts
 dgemm_example
+multi_warp_example
 *.o
 *.a
 *.so
@@ -18,3 +19,6 @@ dgemm_example
 .idea/
 *.swp
 *.swo
+
+# extra docs
+parallel-thread-execution.md
