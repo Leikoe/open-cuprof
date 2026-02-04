@@ -95,9 +95,9 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
 
 int main() {
     // init problem size, here we want to show a single tensor core call, so we use its size
-    int M = 2048;
-    int N = 2048;
-    int K = 2048;
+    int M = 1024;
+    int N = 1024;
+    int K = 1024;
 
     // Calculate grid size
     dim3 grid_size(M / BM, N / BN);
