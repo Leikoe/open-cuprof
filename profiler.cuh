@@ -70,9 +70,10 @@ struct __align__(16) WarpProfiler {
 
     /**
      * @brief Start recording an event section. Call from warp leader only.
-     * @param section_name Pointer to device constant string 
+     * @param section_name Pointer to device constant string
+     * @return Event index to pass to end_event() 
      */
-    __device__ inline void start_event(const char* section_name) {
+    __device__ inline int start_event(const char* section_name) {
         unsigned int block_id;
         asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(block_id));
         
@@ -81,10 +82,10 @@ struct __align__(16) WarpProfiler {
         unsigned int warp_id;
         asm volatile("mov.u32 %0, %%warpid;" : "=r"(warp_id));
         
-        if (warp_id >= MAX_WARPS) return;
+        if (warp_id >= MAX_WARPS) return -1;
         
         int idx = block_profiler.event_counts[warp_id];
-        if (idx >= MAX_EVENTS) return;  // Overflow protection
+        if (idx >= MAX_EVENTS) return -1;  // Overflow protection
         
         uint64_t timestamp;
         asm volatile("mov.u64 %0, %%clock64;" : "=l"(timestamp));
@@ -98,13 +99,19 @@ struct __align__(16) WarpProfiler {
         block_profiler.events[warp_id][idx].valid = 0;  // Not valid until ended
         block_profiler.events[warp_id][idx].smid = smid;
         block_profiler.events[warp_id][idx].block_id = block_id;
+        
+        // Increment counter and return the index for this event
+        block_profiler.event_counts[warp_id]++;
+        return idx;
     }
 
     /**
      * @brief End recording an event section. Call from warp leader only.
-     * @param section_name Pointer to device constant string (should match start)
+     * @param event_id Event index returned by start_event()
      */
-    __device__ inline void end_event(const char* section_name) {
+    __device__ inline void end_event(int event_id) {
+        if (event_id < 0) return;  // Invalid event ID
+        
         unsigned int block_id;
         asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(block_id));
         
@@ -114,19 +121,14 @@ struct __align__(16) WarpProfiler {
         asm volatile("mov.u32 %0, %%warpid;" : "=r"(warp_id));
         
         if (warp_id >= MAX_WARPS) return;
-        
-        int idx = block_profiler.event_counts[warp_id];
-        if (idx >= MAX_EVENTS) return;
+        if (event_id >= MAX_EVENTS) return;
         
         uint64_t timestamp;
         asm volatile("mov.u64 %0, %%clock64;" : "=l"(timestamp));
         
-        // Verify this matches the current event being recorded
-        if (block_profiler.events[warp_id][idx].section_name == section_name) {
-            block_profiler.events[warp_id][idx].end_time = timestamp;
-            block_profiler.events[warp_id][idx].valid = 1;
-            block_profiler.event_counts[warp_id]++;
-        }
+        // Directly access the event by ID - no search needed
+        block_profiler.events[warp_id][event_id].end_time = timestamp;
+        block_profiler.events[warp_id][event_id].valid = 1;
     }
 
     /**

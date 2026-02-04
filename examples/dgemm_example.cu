@@ -42,35 +42,39 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
 
     for (int block_k = 0; block_k < K / BK; block_k++) {
         // rA load
-        if (is_warp_leader) myprofiler.start_event("load_A");
+        int load_a_id = -1;
+        if (is_warp_leader) load_a_id = myprofiler.start_event("load_A");
         {
             int m = block_m * BM + a_row;
             int k = block_k * BK + a_col;
             rA = A[m * K + k];
         }
-        if (is_warp_leader) myprofiler.end_event("load_A");
+        if (is_warp_leader) myprofiler.end_event(load_a_id);
 
         // rB load
-        if (is_warp_leader) myprofiler.start_event("load_B");
+        int load_b_id = -1;
+        if (is_warp_leader) load_b_id = myprofiler.start_event("load_B");
         {
             int k = block_k * BK + b_row;
             int n = block_n * BN + b_col;
             rB = B[k * N + n];
         }
-        if (is_warp_leader) myprofiler.end_event("load_B");
+        if (is_warp_leader) myprofiler.end_event(load_b_id);
 
         // MMA instruction
-        if (is_warp_leader) myprofiler.start_event("mma");
+        int mma_id = -1;
+        if (is_warp_leader) mma_id = myprofiler.start_event("mma");
         // instr doc: https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-mma
         asm volatile("mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%0, %1}, {%2}, {%3}, {%4, %5};"
                      : "=d"(rC[0]), "=d"(rC[1]) // outputs (the two accumulators)
                      : "d"(rA), "d"(rB), "d"(rC[0]), "d"(rC[1]) // inputs (a,b,c)
                      : "memory"); // hint that this instruction modifies memory
-        if (is_warp_leader) myprofiler.end_event("mma");
+        if (is_warp_leader) myprofiler.end_event(mma_id);
     }
 
     // Store results
-    if (is_warp_leader) myprofiler.start_event("store_C");
+    int store_id = -1;
+    if (is_warp_leader) store_id = myprofiler.start_event("store_C");
     // indexing formulas from: https://docs.nvidia.com/cuda/parallel-thread-execution/#mma-884-c-f64
     {
         int groupID = threadIdx.x / BK;
@@ -81,7 +85,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
             C[(block_m * BM + row) * N + (block_n * BN + col)] = rC[i];
         }
     }
-    if (is_warp_leader) myprofiler.end_event("store_C");
+    if (is_warp_leader) myprofiler.end_event(store_id);
 }
 
 int main() {

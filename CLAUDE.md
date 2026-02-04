@@ -6,6 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **open-cuprof** is a lightweight, single-file, header-only profiler for CUDA kernels with Chrome Trace/Perfetto export. The profiler uses PTX special registers (`%laneid`, `%warpid`, `%ctaid`, `%smid`, `%clock64`) for minimal overhead and supports per-warp event tracking without requiring kernel signature changes.
 
+## Core Design Principles
+
+**CRITICAL - Read this before making any changes:**
+
+1. **Minimal Overhead is Paramount**: This profiler is designed for high-performance kernels where every cycle counts. Any change that adds overhead (branches, loops, memory accesses) must be carefully justified. When in doubt, prefer simplicity over features.
+
+2. **Simplest Possible Code**: The implementation should be as straightforward as possible. Avoid clever optimizations, complex data structures, or abstraction layers. Simple, readable code is easier to verify for correctness and performance.
+
+3. **No Loops in Hot Path**: Device-side functions (`start_event()`, `end_event()`) must not contain loops or searches. These functions are called frequently within performance-critical kernels.
+
+4. **Verify Generated Code**: When making changes to device-side code, always check the generated PTX/SASS to ensure no unexpected overhead is introduced.
+
 ## Build Commands
 
 Build all examples:
