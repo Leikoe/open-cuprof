@@ -14,13 +14,6 @@ namespace cuprof {
 struct BlockState {
     uint64_t block_start_time_global;
     int initialized;
-    
-    __device__ void init() {
-        if (threadIdx.x == 0) {
-            initialized = 0;
-        }
-        __syncthreads();
-    }
 };
 
 // Helper to check if current thread is warp leader
@@ -61,13 +54,15 @@ struct Event {
  * 3. Device side - declare shared memory and record events:
  *
  *      __shared__ cuprof::BlockState block_state;
- *      block_state.init();
+ *      myprofiler.init(&block_state);
  *
  *      if (cuprof::is_warp_leader()) {
  *          cuprof::Event e = myprofiler.start("compute", &block_state);
  *          // ... work ...
  *          myprofiler.end(e);
  *      }
+ *
+ *      myprofiler.finish(&block_state);  // Optional
  *
  * 4. Host side - export and cleanup:
  *
@@ -93,6 +88,26 @@ struct __align__(16) Profiler {
     
     // Host-side storage for managing memory
     int num_blocks;
+
+    /**
+     * @brief Initialize block state in shared memory. Call once at kernel start.
+     * @param block_state Pointer to __shared__ BlockState
+     */
+    __device__ inline void init(BlockState* block_state) {
+        if (threadIdx.x == 0) {
+            block_state->initialized = 0;
+        }
+        __syncthreads();
+    }
+
+    /**
+     * @brief Finalize profiling for this block. Optional, for future use.
+     * @param block_state Pointer to __shared__ BlockState
+     */
+    __device__ inline void finish(BlockState* block_state) {
+        // Currently a no-op, but provides a hook for future cleanup logic
+        __syncthreads();
+    }
 
     /**
      * @brief Start recording an event section. Call from warp leader only.

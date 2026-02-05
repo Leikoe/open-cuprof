@@ -21,7 +21,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
                                  double *C  // (M, N)
 ) {
     __shared__ cuprof::BlockState block_state;
-    block_state.init();
+    myprofiler.init(&block_state);
 
     int block_m = blockIdx.x;
     int block_n = blockIdx.y;

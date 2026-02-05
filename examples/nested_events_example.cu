@@ -18,7 +18,7 @@ __global__ void nested_events_kernel(
     int num_iterations
 ) {
     __shared__ cuprof::BlockState block_state;
-    block_state.init();
+    myprofiler.init(&block_state);
 
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     bool is_warp_leader = cuprof::is_warp_leader();

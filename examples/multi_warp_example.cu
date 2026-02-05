@@ -15,7 +15,7 @@ __global__ void multi_warp_kernel(
     int n
 ) {
     __shared__ cuprof::BlockState block_state;
-    block_state.init();
+    myprofiler.init(&block_state);
 
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     unsigned int warp_id;

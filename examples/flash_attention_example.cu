@@ -41,7 +41,7 @@ __global__ void flash_attention_v2_kernel(
     float scale      // 1/sqrt(d)
 ) {
     __shared__ cuprof::BlockState block_state;
-    block_state.init();
+    flash_profiler.init(&block_state);
 
     // Block processes Br rows of Q
     int block_row_start = blockIdx.x * Br;

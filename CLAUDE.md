@@ -71,16 +71,18 @@ __device__ cuprof::Profiler<512, 1> myprofiler;
 
 **String Literal Handling**: Section names are passed as `const char*` pointers to device constant strings. Export code reads these byte-by-byte from device memory to avoid over-reading.
 
-**Event Handle Pattern**: `start()` returns a `cuprof::Event` handle that stores all timing data locally in registers. Only when `end()` is called is the complete event written to global memory in a single operation. This reduces memory traffic by 2x compared to writing on both start and end. Requires a `__shared__` `BlockState` initialized at kernel start:
+**Event Handle Pattern**: `start()` returns a `cuprof::Event` handle that stores all timing data locally in registers. Only when `end()` is called is the complete event written to global memory in a single operation. This reduces memory traffic by 2x compared to writing on both start and end. Requires a `__shared__` `BlockState` initialized via `myprofiler.init()` at kernel start:
 ```cpp
 __shared__ cuprof::BlockState block_state;
-block_state.init();
+myprofiler.init(&block_state);
 
 if (cuprof::is_warp_leader()) {
     cuprof::Event e = myprofiler.start("section_name", &block_state);
     // ... work ...
     myprofiler.end(e);
 }
+
+myprofiler.finish(&block_state);  // Optional cleanup
 ```
 
 **Warp Leader Pattern**: Only the warp leader (lane 0) should call profiler methods to avoid redundant work.
