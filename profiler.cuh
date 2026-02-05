@@ -23,14 +23,14 @@ struct BlockState {
         uint64_t start_time_clock;   // clock64 cycles (for precise duration)
         uint64_t end_time_clock;     // clock64 cycles (for precise duration)
         const char* section_name;    // Pointer to device constant string
-        unsigned int smid;  // SM ID where this event was recorded
     };
 
     // Per-warp event storage
     EventData events[MAX_WARPS][MAX_EVENTS];
     int event_counts[MAX_WARPS];  // Number of events recorded per warp
     
-    // Block initialization - we don't actually need this anymore since we store absolute times
+    // Per-block data (captured once during block_init)
+    unsigned int smid;  // SM ID where this block executes
     int initialized;
 };
 
@@ -47,10 +47,9 @@ struct Event {
     const char* section_name;
     uint64_t start_time_ns;
     uint64_t start_time_clock;
-    unsigned int smid;
     
     __device__ __host__ Event() : section_name(nullptr), 
-                                   start_time_ns(0), start_time_clock(0), smid(0) {}
+                                   start_time_ns(0), start_time_clock(0) {}
     __device__ __host__ bool is_valid() const { return section_name != nullptr; }
 };
 
@@ -100,6 +99,10 @@ struct __align__(16) Profiler {
         BlockState<MAX_EVENTS, MAX_WARPS> &state = block_states[block_id];
         
         if (threadIdx.x == 0) {
+            // Capture SM ID once for entire block
+            unsigned int smid;
+            asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+            state.smid = smid;
             state.initialized = 1;
         }
         __syncthreads();
@@ -117,15 +120,11 @@ struct __align__(16) Profiler {
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(global_time));
         asm volatile("mov.u64 %0, %%clock64;" : "=l"(clock_time));
         
-        unsigned int smid;
-        asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
-        
         // Return event with all data in registers
         Event e;
         e.section_name = section_name;
         e.start_time_ns = global_time;
         e.start_time_clock = clock_time;
-        e.smid = smid;
         return e;
     }
 
@@ -160,7 +159,6 @@ struct __align__(16) Profiler {
         evt.start_time_clock = event.start_time_clock;
         evt.end_time_clock = end_clock;
         evt.section_name = event.section_name;
-        evt.smid = event.smid;
     }
 
     /**
@@ -292,9 +290,9 @@ struct __align__(16) Profiler {
                     
                     out << "    \"ts\": " << std::fixed << std::setprecision(6) << start_us << ",\n";
                     out << "    \"dur\": " << std::fixed << std::setprecision(6) << duration_us << ",\n";
-                    out << "    \"pid\": " << event.smid << ",\n";  // Process = SM ID
+                    out << "    \"pid\": " << state.smid << ",\n";  // Process = SM ID
                     out << "    \"tid\": " << global_warp_id << ",\n";   // Thread = global warp ID
-                    out << "    \"args\": {\"block\": " << block << ", \"warp\": " << warp << ", \"smid\": " << event.smid << "}\n";
+                    out << "    \"args\": {\"block\": " << block << ", \"warp\": " << warp << ", \"smid\": " << state.smid << "}\n";
                     out << "  }";
                 }
             }
