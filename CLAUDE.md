@@ -50,12 +50,13 @@ Run examples:
 
 **profiler.cuh** (single header-only file):
 - Namespace: `cuprof` - All types and functions are in this namespace
-- `cuprof::Profiler<MAX_EVENTS, MAX_WARPS>` template struct: Main profiler implementation
+- `cuprof::Profiler<MAX_EVENTS, MAX_WARPS>` template struct: Singleton profiler instance managing per-block state
   - `MAX_EVENTS`: Maximum events per warp per block (default: 128)
   - `MAX_WARPS`: Maximum warps to track per block (default: 32)
+- `cuprof::BlockState<MAX_EVENTS, MAX_WARPS>` template struct: Per-block profiling data (allocated in global memory)
+  - Contains event storage, event counts, and timing initialization state
 - Types:
   - `cuprof::Event` - Event handle returned by `start()` and passed to `end()`. Stores all timing data locally in registers until `end()` is called.
-  - `cuprof::EventData` - Internal struct for storing event data in global memory
 - Device-side API: `start()`, `end()` called from warp leaders only
 - Host-side API: `cuprof::init()`, `cuprof::export_and_cleanup()`
 - Helper: `cuprof::is_warp_leader()` - PTX-based check for lane 0
@@ -71,18 +72,13 @@ __device__ cuprof::Profiler<512, 1> myprofiler;
 
 **String Literal Handling**: Section names are passed as `const char*` pointers to device constant strings. Export code reads these byte-by-byte from device memory to avoid over-reading.
 
-**Event Handle Pattern**: `start()` returns a `cuprof::Event` handle that stores all timing data locally in registers. Only when `end()` is called is the complete event written to global memory in a single operation. This reduces memory traffic by 2x compared to writing on both start and end. Requires a `__shared__` `BlockState` initialized via `myprofiler.init()` at kernel start:
+**Event Handle Pattern**: `start()` returns a `cuprof::Event` handle that stores all timing data locally in registers. Only when `end()` is called is the complete event written to global memory in a single operation. This reduces memory traffic by 2x compared to writing on both start and end:
 ```cpp
-__shared__ cuprof::BlockState block_state;
-myprofiler.init(&block_state);
-
 if (cuprof::is_warp_leader()) {
-    cuprof::Event e = myprofiler.start("section_name", &block_state);
+    cuprof::Event e = myprofiler.start("section_name");
     // ... work ...
     myprofiler.end(e);
 }
-
-myprofiler.finish(&block_state);  // Optional cleanup
 ```
 
 **Warp Leader Pattern**: Only the warp leader (lane 0) should call profiler methods to avoid redundant work.
@@ -158,12 +154,11 @@ When adding new features to `profiler.cuh`:
 - **Device-side methods**: Must use PTX inline assembly for special registers (`%laneid`, `%warpid`, `%ctaid.x`, `%smid`, `%globaltimer`, `%clock64`)
 - **Hybrid timing approach** (optimized for minimal overhead): 
   - `%globaltimer` captured once per block via lazy initialization with `atomicCAS`
-  - All warps in a block share the same global time reference (stored in `__shared__` `BlockState`)
+  - All warps in a block share the same global time reference (stored in per-block `BlockState`)
   - `%clock64` provides precise duration measurement (cycle-level precision)
   - Start times use shared globaltimer for cross-SM coherence
   - Durations use clock64 delta for high precision
   - Only one `%globaltimer` read per block (amortized cost across all warps)
-  - Block state in shared memory (16 bytes) for fast access
 - **Event overflow**: Both `start()` and `end()` include bounds checking (`if (idx >= MAX_EVENTS) return`)
 - **Memory optimization**: `start()` captures all data in registers (no gmem writes), `end()` writes everything to gmem in one operation (2x reduction in memory traffic)
 - **Timestamp conversion**: 

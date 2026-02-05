@@ -20,8 +20,6 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
                                  double *B, // (K, N)
                                  double *C  // (M, N)
 ) {
-    __shared__ cuprof::BlockState block_state;
-    myprofiler.init(&block_state);
 
     int block_m = blockIdx.x;
     int block_n = blockIdx.y;
@@ -46,7 +44,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
     for (int block_k = 0; block_k < K / BK; block_k++) {
         // rA load
         cuprof::Event load_a_id;
-        if (is_warp_leader) load_a_id = myprofiler.start("load_A", &block_state);
+        if (is_warp_leader) load_a_id = myprofiler.start("load_A");
         {
             int m = block_m * BM + a_row;
             int k = block_k * BK + a_col;
@@ -56,7 +54,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
 
         // rB load
         cuprof::Event load_b_id;
-        if (is_warp_leader) load_b_id = myprofiler.start("load_B", &block_state);
+        if (is_warp_leader) load_b_id = myprofiler.start("load_B");
         {
             int k = block_k * BK + b_row;
             int n = block_n * BN + b_col;
@@ -66,7 +64,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
 
         // MMA instruction
         cuprof::Event mma_id;
-        if (is_warp_leader) mma_id = myprofiler.start("mma", &block_state);
+        if (is_warp_leader) mma_id = myprofiler.start("mma");
         // instr doc: https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-mma
         asm volatile("mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%0, %1}, {%2}, {%3}, {%4, %5};"
                      : "=d"(rC[0]), "=d"(rC[1]) // outputs (the two accumulators)
@@ -77,7 +75,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
 
     // Store results
     cuprof::Event store_id;
-    if (is_warp_leader) store_id = myprofiler.start("store_C", &block_state);
+    if (is_warp_leader) store_id = myprofiler.start("store_C");
     // indexing formulas from: https://docs.nvidia.com/cuda/parallel-thread-execution/#mma-884-c-f64
     {
         int groupID = threadIdx.x / BK;

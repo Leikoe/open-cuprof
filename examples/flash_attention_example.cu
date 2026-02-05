@@ -40,8 +40,6 @@ __global__ void flash_attention_v2_kernel(
     int N,           // sequence length
     float scale      // 1/sqrt(d)
 ) {
-    __shared__ cuprof::BlockState block_state;
-    flash_profiler.init(&block_state);
 
     // Block processes Br rows of Q
     int block_row_start = blockIdx.x * Br;
@@ -63,7 +61,7 @@ __global__ void flash_attention_v2_kernel(
     cuprof::Event total_event;
 
     if (is_leader) {
-        total_event = flash_profiler.start("warp_total", &block_state);
+        total_event = flash_profiler.start("warp_total");
     }
 
     // Per-thread registers for Q row (each thread handles one Q row)
@@ -74,7 +72,7 @@ __global__ void flash_attention_v2_kernel(
 
     // Load Q rows for this warp
     cuprof::Event load_q_event;
-    if (is_leader) load_q_event = flash_profiler.start("load_Q", &block_state);
+    if (is_leader) load_q_event = flash_profiler.start("load_Q");
 
     int my_row = warp_row_start + lane_id;
     if (my_row < warp_row_end && lane_id < rows_per_warp) {
@@ -96,11 +94,11 @@ __global__ void flash_attention_v2_kernel(
         int tile_size = kv_end - kv_start;
 
         cuprof::Event tile_event;
-        if (is_leader) tile_event = flash_profiler.start("process_KV_tile", &block_state);
+        if (is_leader) tile_event = flash_profiler.start("process_KV_tile");
 
         // Cooperatively load K tile into shared memory
         cuprof::Event load_k_event;
-        if (is_leader) load_k_event = flash_profiler.start("load_K_tile", &block_state);
+        if (is_leader) load_k_event = flash_profiler.start("load_K_tile");
 
         for (int i = threadIdx.x; i < Bc * d; i += THREADS_PER_BLOCK) {
             int row = i / d;
@@ -118,7 +116,7 @@ __global__ void flash_attention_v2_kernel(
 
         // Cooperatively load V tile into shared memory
         cuprof::Event load_v_event;
-        if (is_leader) load_v_event = flash_profiler.start("load_V_tile", &block_state);
+        if (is_leader) load_v_event = flash_profiler.start("load_V_tile");
 
         for (int i = threadIdx.x; i < Bc * d; i += THREADS_PER_BLOCK) {
             int row = i / d;
@@ -136,7 +134,7 @@ __global__ void flash_attention_v2_kernel(
 
         // Compute attention scores S = Q @ K^T for this tile
         cuprof::Event qk_event;
-        if (is_leader) qk_event = flash_profiler.start("compute_QK", &block_state);
+        if (is_leader) qk_event = flash_profiler.start("compute_QK");
 
         float S_reg[Bc];  // Attention scores in registers
 
@@ -160,7 +158,7 @@ __global__ void flash_attention_v2_kernel(
 
         // Online softmax update (FA2: computed in registers, not shared memory)
         cuprof::Event softmax_event;
-        if (is_leader) softmax_event = flash_profiler.start("online_softmax", &block_state);
+        if (is_leader) softmax_event = flash_profiler.start("online_softmax");
 
         if (my_row < warp_row_end && lane_id < rows_per_warp) {
             // Find max in current tile
@@ -196,7 +194,7 @@ __global__ void flash_attention_v2_kernel(
 
         // Accumulate O += P @ V (P are the normalized scores in S_reg)
         cuprof::Event pv_event;
-        if (is_leader) pv_event = flash_profiler.start("accumulate_PV", &block_state);
+        if (is_leader) pv_event = flash_profiler.start("accumulate_PV");
 
         if (my_row < warp_row_end && lane_id < rows_per_warp) {
             #pragma unroll
@@ -218,7 +216,7 @@ __global__ void flash_attention_v2_kernel(
 
     // Final normalization and write output
     cuprof::Event write_event;
-    if (is_leader) write_event = flash_profiler.start("write_output", &block_state);
+    if (is_leader) write_event = flash_profiler.start("write_output");
 
     if (my_row < warp_row_end && lane_id < rows_per_warp) {
         #pragma unroll

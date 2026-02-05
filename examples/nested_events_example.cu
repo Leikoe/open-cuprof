@@ -17,8 +17,6 @@ __global__ void nested_events_kernel(
     int n,
     int num_iterations
 ) {
-    __shared__ cuprof::BlockState block_state;
-    myprofiler.init(&block_state);
 
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     bool is_warp_leader = cuprof::is_warp_leader();
@@ -29,23 +27,23 @@ __global__ void nested_events_kernel(
     
     // Profile the entire computation (outer event)
     cuprof::Event total_id;
-    if (is_warp_leader) total_id = myprofiler.start("total_computation", &block_state);
+    if (is_warp_leader) total_id = myprofiler.start("total_computation");
     
     // Loop through iterations - each iteration is a nested scope
     for (int iter = 0; iter < num_iterations; iter++) {
         // Profile this iteration (nested within total_computation)
         cuprof::Event iter_id;
-        if (is_warp_leader) iter_id = myprofiler.start("iteration", &block_state);
+        if (is_warp_leader) iter_id = myprofiler.start("iteration");
         
         // Phase 1: Data preparation (nested within iteration)
         cuprof::Event prep_id;
-        if (is_warp_leader) prep_id = myprofiler.start("prepare", &block_state);
+        if (is_warp_leader) prep_id = myprofiler.start("prepare");
         float temp = value * 0.1f;
         if (is_warp_leader) myprofiler.end(prep_id);
         
         // Phase 2: Heavy computation (nested within iteration)
         cuprof::Event comp_id;
-        if (is_warp_leader) comp_id = myprofiler.start("compute", &block_state);
+        if (is_warp_leader) comp_id = myprofiler.start("compute");
         #pragma unroll 1
         for (int i = 0; i < 20; i++) {
             temp = sqrtf(temp * temp + 1.0f);
@@ -54,7 +52,7 @@ __global__ void nested_events_kernel(
         
         // Phase 3: Update (nested within iteration)
         cuprof::Event upd_id;
-        if (is_warp_leader) upd_id = myprofiler.start("update", &block_state);
+        if (is_warp_leader) upd_id = myprofiler.start("update");
         value += temp;
         if (is_warp_leader) myprofiler.end(upd_id);
         
@@ -64,7 +62,7 @@ __global__ void nested_events_kernel(
     
     // Final reduction phase (nested within total_computation)
     cuprof::Event final_id;
-    if (is_warp_leader) final_id = myprofiler.start("finalize", &block_state);
+    if (is_warp_leader) final_id = myprofiler.start("finalize");
     value = value / static_cast<float>(num_iterations);
     if (is_warp_leader) myprofiler.end(final_id);
     
