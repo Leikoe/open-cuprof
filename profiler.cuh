@@ -34,20 +34,69 @@ struct BlockState {
     int initialized;
 };
 
-// Helper to check if current thread is warp leader
-__device__ __forceinline__ bool is_warp_leader() {
+// PTX special register helpers
+__device__ __forceinline__ unsigned int get_laneid() {
     unsigned int lane_id;
     asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
-    return lane_id == 0;
+    return lane_id;
+}
+
+__device__ __forceinline__ unsigned int get_warpid() {
+    unsigned int warp_id;
+    asm volatile("mov.u32 %0, %%warpid;" : "=r"(warp_id));
+    return warp_id;
+}
+
+__device__ __forceinline__ unsigned int get_ctaid_x() {
+    unsigned int cta_id;
+    asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(cta_id));
+    return cta_id;
+}
+
+__device__ __forceinline__ unsigned int get_smid() {
+    unsigned int sm_id;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(sm_id));
+    return sm_id;
+}
+
+__device__ __forceinline__ unsigned int get_tid_x() {
+    unsigned int tid;
+    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(tid));
+    return tid;
+}
+
+__device__ __forceinline__ unsigned int get_tid_y() {
+    unsigned int tid;
+    asm volatile("mov.u32 %0, %%tid.y;" : "=r"(tid));
+    return tid;
+}
+
+__device__ __forceinline__ unsigned int get_tid_z() {
+    unsigned int tid;
+    asm volatile("mov.u32 %0, %%tid.z;" : "=r"(tid));
+    return tid;
+}
+
+__device__ __forceinline__ uint64_t get_globaltimer() {
+    uint64_t time;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(time));
+    return time;
+}
+
+__device__ __forceinline__ uint64_t get_clock64() {
+    uint64_t clk;
+    asm volatile("mov.u64 %0, %%clock64;" : "=l"(clk));
+    return clk;
+}
+
+// Helper to check if current thread is warp leader
+__device__ __forceinline__ bool is_warp_leader() {
+    return get_laneid() == 0;
 }
 
 // Helper to check if current thread is CTA (block) leader
 __device__ __forceinline__ bool is_cta_leader() {
-    unsigned int tid_x, tid_y, tid_z;
-    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(tid_x));
-    asm volatile("mov.u32 %0, %%tid.y;" : "=r"(tid_y));
-    asm volatile("mov.u32 %0, %%tid.z;" : "=r"(tid_z));
-    return (tid_x | tid_y | tid_z) == 0;
+    return (get_tid_x() | get_tid_y() | get_tid_z()) == 0;
 }
 
 
@@ -100,16 +149,12 @@ struct __align__(16) Profiler {
      * Should be called by one thread (e.g., CTA leader) with a __syncthreads() after.
      */
     __device__ inline void block_init() {
-        unsigned int block_id;
-        asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(block_id));
-        
+        unsigned int block_id = get_ctaid_x();
         BlockState<MAX_EVENTS, MAX_WARPS> &state = block_states[block_id];
         
         if (is_cta_leader()) {
             // Capture SM ID once for entire block
-            unsigned int smid;
-            asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
-            state.smid = smid;
+            state.smid = get_smid();
             state.initialized = 1;
         }
         __syncthreads();
@@ -123,15 +168,10 @@ struct __align__(16) Profiler {
      */
     __device__ inline Event start(const char* section_name) {
         // Capture both globaltimer (for cross-SM sync) and clock64 (for precise duration)
-        uint64_t global_time, clock_time;
-        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(global_time));
-        asm volatile("mov.u64 %0, %%clock64;" : "=l"(clock_time));
-        
-        // Return event with all data in registers
         Event e;
         e.section_name = section_name;
-        e.start_time_ns = global_time;
-        e.start_time_clock = clock_time;
+        e.start_time_ns = get_globaltimer();
+        e.start_time_clock = get_clock64();
         return e;
     }
 
@@ -142,19 +182,14 @@ struct __align__(16) Profiler {
      */
     __device__ inline void end(Event event) {
         // Capture end time FIRST for precise timing
-        uint64_t end_clock;
-        asm volatile("mov.u64 %0, %%clock64;" : "=l"(end_clock));
+        uint64_t end_clock = get_clock64();
         
         if (!event.is_valid()) return;  // Invalid event
         
-        unsigned int block_id;
-        asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(block_id));
-        
+        unsigned int block_id = get_ctaid_x();
         BlockState<MAX_EVENTS, MAX_WARPS> &state = block_states[block_id];
         
-        unsigned int warp_id;
-        asm volatile("mov.u32 %0, %%warpid;" : "=r"(warp_id));
-        
+        unsigned int warp_id = get_warpid();
         if (warp_id >= MAX_WARPS) return;
         
         // Atomically reserve an index for this event
