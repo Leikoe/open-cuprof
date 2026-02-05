@@ -29,8 +29,9 @@ struct BlockState {
     EventData events[MAX_WARPS][MAX_EVENTS];
     int event_counts[MAX_WARPS];  // Number of events recorded per warp
     
-    // Block-wide global time reference (captured once on first start)
-    uint64_t block_start_time_global;
+    // Block-wide time references (captured once on first start)
+    uint64_t block_start_time_global;  // globaltimer reference
+    uint64_t block_start_time_clock;   // clock64 reference (same moment as global)
     int initialized;
 };
 
@@ -106,20 +107,23 @@ struct __align__(16) Profiler {
         
         if (warp_id >= MAX_WARPS) return Event();
         
-        // Initialize block global time reference on first call (lazy initialization)
+        // Initialize block time references on first call (lazy initialization)
+        // Capture both globaltimer and clock64 at the same moment for correlation
         // Using atomicCAS ensures only one warp initializes it
         if (state.initialized == 0) {
             if (atomicCAS(&state.initialized, 0, 1) == 0) {
-                uint64_t global_time;
-                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(global_time));
-                state.block_start_time_global = global_time;
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(state.block_start_time_global));
+                asm volatile("mov.u64 %0, %%clock64;" : "=l"(state.block_start_time_clock));
+                __threadfence();  // Ensure writes are visible to all threads
             }
+            // Spin until initialization is complete (initialized becomes 1)
+            while (state.initialized == 0);
         }
         
         int idx = state.event_counts[warp_id];
         if (idx >= MAX_EVENTS) return Event();  // Overflow protection
         
-        // Capture all data in registers - no gmem writes
+        // Capture clock64 only - no globaltimer read per event (optimization)
         uint64_t clock_time;
         asm volatile("mov.u64 %0, %%clock64;" : "=l"(clock_time));
         
@@ -129,11 +133,16 @@ struct __align__(16) Profiler {
         // Increment counter for next event
         state.event_counts[warp_id]++;
         
+        // Compute global time from clock delta and block reference
+        // This avoids reading globaltimer on every start() call
+        uint64_t clock_delta = clock_time - state.block_start_time_clock;
+        uint64_t global_time_now = state.block_start_time_global + clock_delta;
+        
         // Return event with all data in registers
         Event e;
         e.id = idx;
         e.section_name = section_name;
-        e.start_time_global = state.block_start_time_global;
+        e.start_time_global = global_time_now;
         e.start_time_clock = clock_time;
         e.smid = smid;
         e.block_id = block_id;
@@ -240,11 +249,16 @@ struct __align__(16) Profiler {
             for (int warp = 0; warp < MAX_WARPS; warp++) {
                 for (int evt = 0; evt < state.event_counts[warp]; evt++) {
                     const typename BlockState<MAX_EVENTS, MAX_WARPS>::EventData &event = state.events[warp][evt];
-                    if (event.section_name != nullptr) {
+                    if (event.section_name != nullptr && event.start_time_global > 0) {
                         global_min_time = std::min(global_min_time, event.start_time_global);
                     }
                 }
             }
+        }
+        
+        // If no valid events found, set to 0 to avoid underflow
+        if (global_min_time == UINT64_MAX) {
+            global_min_time = 0;
         }
 
         out << "[\n";
