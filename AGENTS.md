@@ -1,0 +1,175 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+**open-cuprof** is a lightweight, single-file, header-only profiler for CUDA kernels with Chrome Trace/Perfetto export. The profiler uses PTX special registers (`%laneid`, `%warpid`, `%ctaid`, `%smid`, `%globaltimer`, `%clock64`) for minimal overhead and supports per-warp event tracking without requiring kernel signature changes.
+
+## Core Design Principles
+
+**CRITICAL - Read this before making any changes:**
+
+1. **Minimal Overhead is Paramount**: This profiler is designed for high-performance kernels where every cycle counts. Any change that adds overhead (branches, loops, memory accesses) must be carefully justified. When in doubt, prefer simplicity over features.
+
+2. **Simplest Possible Code**: The implementation should be as straightforward as possible. Avoid clever optimizations, complex data structures, or abstraction layers. Simple, readable code is easier to verify for correctness and performance.
+
+3. **No Loops in Hot Path**: Device-side functions (`start()`, `end()`) must not contain loops or searches. These functions are called frequently within performance-critical kernels.
+
+4. **Verify Generated Code**: When making changes to device-side code, always check the generated PTX/SASS to ensure no unexpected overhead is introduced.
+
+## Build Commands
+
+Build all examples:
+```bash
+make
+```
+
+Build individual examples:
+```bash
+make dgemm_example
+make multi_warp_example
+```
+
+Clean build artifacts and generated traces:
+```bash
+make clean
+```
+
+Run examples:
+```bash
+./dgemm_example              # generates trace.json
+./multi_warp_example         # generates multi_warp_trace.json
+```
+
+**Note**: The Makefile uses `-arch=sm_89` (Ada Lovelace architecture). Adjust this flag if targeting a different GPU architecture.
+
+## Architecture
+
+### Core Components
+
+**profiler.cuh** (single header-only file):
+- Namespace: `cuprof` - All types and functions are in this namespace
+- `cuprof::Profiler<MAX_EVENTS, MAX_WARPS>` template struct: Singleton profiler instance managing per-block state
+  - `MAX_EVENTS`: Maximum events per warp per block (default: 128)
+  - `MAX_WARPS`: Maximum warps to track per block (default: 32)
+- `cuprof::BlockState<MAX_EVENTS, MAX_WARPS>` template struct: Per-block profiling data (allocated in global memory)
+  - Contains event storage, event counts, and timing initialization state
+- Types:
+  - `cuprof::Event` - Event handle returned by `start()` and passed to `end()`. Stores all timing data locally in registers until `end()` is called.
+- Device-side API: `start()`, `end()` called from warp leaders only
+- Host-side API: `cuprof::init()`, `cuprof::export_and_cleanup()`
+- Helper: `cuprof::is_warp_leader()` - PTX-based check for lane 0
+
+### Key Design Patterns
+
+**Device Global Profilers**: Profilers are declared as `__device__` globals to avoid modifying kernel signatures:
+```cpp
+__device__ cuprof::Profiler<512, 1> myprofiler;
+```
+
+**Per-Block Storage**: Each profiler maintains a `block_data` pointer to device memory allocated for all blocks. Device code uses `%ctaid.x` to index into per-block data.
+
+**String Literal Handling**: Section names are passed as `const char*` pointers to device constant strings. Export code reads these byte-by-byte from device memory to avoid over-reading.
+
+**Event Handle Pattern**: `start()` returns a `cuprof::Event` handle that stores all timing data locally in registers. Only when `end()` is called is the complete event written to global memory in a single operation. This reduces memory traffic by 2x compared to writing on both start and end. Requires calling `block_init()` once at kernel start:
+```cpp
+myprofiler.block_init();  // Once at kernel start
+
+if (cuprof::is_warp_leader()) {
+    cuprof::Event e = myprofiler.start("section_name");
+    // ... work ...
+    myprofiler.end(e);
+}
+```
+
+**Warp Leader Pattern**: Only the warp leader (lane 0) should call profiler methods to avoid redundant work.
+
+**Chrome Trace Format**: Export uses the Trace Event Format with:
+- `pid` (process ID) = SM ID (shows actual hardware execution)
+- `tid` (thread ID) = warp ID within SM
+- `args` = Additional metadata (block ID, SM ID)
+- Timestamps normalized relative to global minimum and converted to microseconds
+
+This visualization approach shows actual hardware utilization rather than logical block layout, making it easier to identify SM load imbalancing and understand how the CUDA scheduler maps blocks to physical hardware.
+
+### Memory Management
+
+1. Host calls `cuprof::init(&profiler, num_blocks)`:
+   - Allocates device memory for `num_blocks` worth of `cuprof::Profiler` instances
+   - Uses `cudaMemcpyToSymbol` to copy profiler struct to `__device__` global
+
+2. Device code directly indexes into `block_data` array using block/warp IDs
+
+3. Host calls `cuprof::export_and_cleanup(&profiler, "trace.json")`:
+   - Uses `cudaMemcpyFromSymbol` to retrieve profiler struct
+   - Copies all per-block data from device to host
+   - Retrieves string literals byte-by-byte from device memory
+   - Exports Chrome Trace JSON
+   - Frees all device memory
+
+## Example Structure
+
+**examples/dgemm_example.cu**: Demonstrates profiling a tensor core DGEMM kernel using `mma.m8n8k4.f64` PTX instruction with profiling of:
+- `load_A`: Loading A matrix elements
+- `load_B`: Loading B matrix elements  
+- `mma`: Tensor core matrix multiply-accumulate
+- `store_C`: Storing result to C matrix
+
+**examples/multi_warp_example.cu**: Demonstrates per-warp profiling with multiple warps per block (4 warps, 128 threads total). Each warp performs different computational workloads with measurable timing:
+- Warp 0: Simple vector addition (load → add → store)
+- Warp 1: Vector multiplication followed by heavy sqrt loop (100 iterations)
+- Warp 2: Exponential function loop (50 iterations) with `__syncthreads()` 
+- Warp 3: Trigonometric function loop (30 sin/cos iterations) with log finalization
+
+This example shows how the profiler tracks independent work across warps within the same block. The different workloads produce measurable timing differences, making it easy to compare warp performance. When viewed in Chrome Trace, each warp appears as a separate thread (tid) within each block (pid), with clearly visible duration bars showing the relative cost of different operations.
+
+**examples/nested_events_example.cu**: Demonstrates hierarchical profiling with nested events. Shows zero-overhead nesting using event handles - no loops or searches needed. Features:
+- Outer event spanning entire computation
+- Inner events for each iteration
+- Further nested events within iterations (prepare, compute, update)
+- Direct array indexing for O(1) event access
+
+**examples/flash_attention_example.cu**: Production-quality Flash Attention v2 implementation for Ampere with comprehensive profiling. Demonstrates profiling of a real-world optimized kernel with:
+- Per-warp total execution timing (FA2 parallelizes over warps)
+- Q loading (once per warp, streamed to registers)
+- Per-tile K/V loading (16 tiles for 1024 sequence, cooperative across block)
+- QK^T computation (register-based, parallel across warps)
+- Online softmax (computed in registers, not shared memory)
+- PV accumulation (register-based)
+- Output writing
+
+Key FA2 improvements over FA1:
+- Better parallelism: Each warp independently processes 16 rows (4 warps per block)
+- Reduced shared memory: Only K/V tiles stored (64x64), no attention score matrix
+- Register efficiency: Softmax computed entirely in registers
+- Performance: ~133 GFLOPS on 1024 sequence length
+
+This example shows how the profiler scales to complex kernels with multiple nested operations and demonstrates the overhead is negligible even with extensive instrumentation.
+
+All examples show profiling without kernel signature changes, using only warp leader checks.
+
+## Modifying the Profiler
+
+When adding new features to `profiler.cuh`:
+
+- **Device-side methods**: Must use PTX inline assembly for special registers (`%laneid`, `%warpid`, `%ctaid.x`, `%smid`, `%globaltimer`, `%clock64`)
+- **Hybrid timing approach** (optimized for minimal overhead): 
+  - `%globaltimer` and `%clock64` captured once per block in `block_init()`
+  - Per-event timestamps computed as: `block_global + (clock_now - block_clock)`
+  - `%clock64` provides precise duration measurement (cycle-level precision)
+  - Start times use globaltimer-based estimation for cross-SM coherence
+  - Durations use clock64 delta for high precision
+  - Only one `%globaltimer` read per block (zero overhead in `start()`/`end()`)
+- **Event overflow**: Both `start()` and `end()` include bounds checking (`if (idx >= MAX_EVENTS) return`)
+- **Memory optimization**: `start()` captures all data in registers (no gmem writes), `end()` writes everything to gmem in one operation (2x reduction in memory traffic)
+- **Timestamp conversion**: 
+  - Start times: `%globaltimer` nanoseconds normalized to global minimum
+  - Durations: `%clock64` cycle deltas converted using GPU clock rate
+- **Export format**: Chrome Trace uses "X" phase (complete events) with `ts` (timestamp) and `dur` (duration) in microseconds
+
+## Viewing Traces
+
+Generated `trace.json` files can be viewed in:
+- Chrome: `chrome://tracing`
+- Perfetto: https://ui.perfetto.dev/

@@ -21,6 +21,7 @@ flash_attention_example
 .idea/
 *.swp
 *.swo
+.claude/
 
 # extra docs
 parallel-thread-execution.md
