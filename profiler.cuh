@@ -141,6 +141,10 @@ struct __align__(16) Profiler {
      * @param event Event handle returned by start()
      */
     __device__ inline void end(Event event) {
+        // Capture end time FIRST for precise timing
+        uint64_t end_clock;
+        asm volatile("mov.u64 %0, %%clock64;" : "=l"(end_clock));
+        
         if (!event.is_valid()) return;  // Invalid event
         
         unsigned int block_id;
@@ -156,9 +160,6 @@ struct __align__(16) Profiler {
         // Atomically reserve an index for this event
         int idx = atomicAdd(&state.event_counts[warp_id], 1);
         if (idx >= MAX_EVENTS) return;  // Overflow protection
-        
-        uint64_t end_clock;
-        asm volatile("mov.u64 %0, %%clock64;" : "=l"(end_clock));
         
         // Write all event data to gmem in one go
         typename BlockState<MAX_EVENTS, MAX_WARPS>::EventData &evt = state.events[warp_id][idx];
