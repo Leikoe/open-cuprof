@@ -48,8 +48,6 @@ struct Event {
     uint64_t start_time_ns;
     uint64_t start_time_clock;
     
-    __device__ __host__ Event() : section_name(nullptr), 
-                                   start_time_ns(0), start_time_clock(0) {}
     __device__ __host__ bool is_valid() const { return section_name != nullptr; }
 };
 
