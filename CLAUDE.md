@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**open-cuprof** is a lightweight, single-file, header-only profiler for CUDA kernels with Chrome Trace/Perfetto export. The profiler uses PTX special registers (`%laneid`, `%warpid`, `%ctaid`, `%smid`, `%clock64`) for minimal overhead and supports per-warp event tracking without requiring kernel signature changes.
+**open-cuprof** is a lightweight, single-file, header-only profiler for CUDA kernels with Chrome Trace/Perfetto export. The profiler uses PTX special registers (`%laneid`, `%warpid`, `%ctaid`, `%smid`, `%globaltimer`, `%clock64`) for minimal overhead and supports per-warp event tracking without requiring kernel signature changes.
 
 ## Core Design Principles
 
@@ -150,12 +150,20 @@ All examples show profiling without kernel signature changes, using only warp le
 
 When adding new features to `profiler.cuh`:
 
-- **Device-side methods**: Must use PTX inline assembly for special registers (`%laneid`, `%warpid`, `%ctaid.x`, `%smid`, `%clock64`)
+- **Device-side methods**: Must use PTX inline assembly for special registers (`%laneid`, `%warpid`, `%ctaid.x`, `%smid`, `%globaltimer`, `%clock64`)
+- **Hybrid timing approach** (optimized for minimal overhead): 
+  - `%globaltimer` captured once per block via lazy initialization with `atomicCAS`
+  - All warps in a block share the same global time reference
+  - `%clock64` provides precise duration measurement (cycle-level precision)
+  - Start times use shared globaltimer for cross-SM coherence
+  - Durations use clock64 delta for high precision
+  - Only one `%globaltimer` read per block (amortized cost across all warps)
 - **Event overflow**: Both `start_event()` and `end_event()` include bounds checking (`if (idx >= MAX_EVENTS) return`)
-- **Event validity**: Events are only marked valid (`.valid = 1`) when `end_event()` is called with matching section name
-- **Timestamp conversion**: `%clock64` cycle counts are converted to microseconds using GPU clock rate, normalized per-SM to handle per-SM cycle counters
+- **Event validity**: Events are only marked valid (`.valid = 1`) when `end_event()` is called
+- **Timestamp conversion**: 
+  - Start times: `%globaltimer` nanoseconds normalized to global minimum
+  - Durations: `%clock64` cycle deltas converted using GPU clock rate
 - **Export format**: Chrome Trace uses "X" phase (complete events) with `ts` (timestamp) and `dur` (duration) in microseconds
-- **Per-SM normalization**: Since `%clock64` is a per-SM counter, timestamps are normalized to each SM's minimum time to ensure proper visualization
 
 ## Viewing Traces
 

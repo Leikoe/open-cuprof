@@ -55,9 +55,10 @@ struct Event {
 template <int MAX_EVENTS = 128, int MAX_WARPS = 32>
 struct __align__(16) Profiler {
     struct EventData {
-        uint64_t start_time;
-        uint64_t end_time;
-        const char* section_name;  // Pointer to device constant string
+        uint64_t start_time_global;  // globaltimer nanoseconds (for cross-SM alignment)
+        uint64_t start_time_clock;   // clock64 cycles (for precise timing)
+        uint64_t end_time_clock;     // clock64 cycles (for precise timing)
+        const char* section_name;    // Pointer to device constant string
         int valid;  // 1 if event is valid, 0 otherwise
         unsigned int smid;  // SM ID where this event was recorded
         unsigned int block_id;  // Block ID for reference
@@ -67,6 +68,10 @@ struct __align__(16) Profiler {
     EventData events[MAX_WARPS][MAX_EVENTS];
     int event_counts[MAX_WARPS];  // Number of events recorded per warp
 
+    // Block-wide global time reference (captured once on first start_event)
+    uint64_t block_start_time_global;
+    int block_time_initialized;  // 0 = not initialized, 1 = initialized
+    
     // Device pointer to per-block data
     Profiler *block_data;
     
@@ -89,18 +94,32 @@ struct __align__(16) Profiler {
         
         if (warp_id >= MAX_WARPS) return Event();
         
+        // Initialize block global time reference on first call (lazy initialization)
+        // Using atomicCAS ensures only one warp initializes it
+        if (block_profiler.block_time_initialized == 0) {
+            if (atomicCAS(&block_profiler.block_time_initialized, 0, 1) == 0) {
+                uint64_t global_time;
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(global_time));
+                block_profiler.block_start_time_global = global_time;
+            }
+        }
+        
         int idx = block_profiler.event_counts[warp_id];
         if (idx >= MAX_EVENTS) return Event();  // Overflow protection
         
-        uint64_t timestamp;
-        asm volatile("mov.u64 %0, %%clock64;" : "=l"(timestamp));
+        // Capture clock64 for precise timing
+        uint64_t clock_time;
+        asm volatile("mov.u64 %0, %%clock64;" : "=l"(clock_time));
         
         unsigned int smid;
         asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
         
-        block_profiler.events[warp_id][idx].start_time = timestamp;
+        // Use block-wide global time reference (initialized once per block)
+        // This avoids redundant globaltimer reads per warp
+        block_profiler.events[warp_id][idx].start_time_global = block_profiler.block_start_time_global;
+        block_profiler.events[warp_id][idx].start_time_clock = clock_time;
         block_profiler.events[warp_id][idx].section_name = section_name;
-        block_profiler.events[warp_id][idx].end_time = 0;
+        block_profiler.events[warp_id][idx].end_time_clock = 0;
         block_profiler.events[warp_id][idx].valid = 0;  // Not valid until ended
         block_profiler.events[warp_id][idx].smid = smid;
         block_profiler.events[warp_id][idx].block_id = block_id;
@@ -128,11 +147,11 @@ struct __align__(16) Profiler {
         if (warp_id >= MAX_WARPS) return;
         if (event.id >= MAX_EVENTS) return;
         
-        uint64_t timestamp;
-        asm volatile("mov.u64 %0, %%clock64;" : "=l"(timestamp));
+        uint64_t clock_time;
+        asm volatile("mov.u64 %0, %%clock64;" : "=l"(clock_time));
         
         // Directly access the event by handle - no search needed
-        block_profiler.events[warp_id][event.id].end_time = timestamp;
+        block_profiler.events[warp_id][event.id].end_time_clock = clock_time;
         block_profiler.events[warp_id][event.id].valid = 1;
     }
 
@@ -197,19 +216,15 @@ struct __align__(16) Profiler {
         int clock_rate_khz;
         cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate, device);
         
-        // Find per-SM minimum start time (since clock64 is per-SM)
-        std::unordered_map<unsigned int, uint64_t> sm_min_time;
+        // Find global minimum start time (using globaltimer) for normalization
+        uint64_t global_min_time = UINT64_MAX;
         for (int block = 0; block < num_blocks; block++) {
             const Profiler &profiler = h_data[block];
             for (int warp = 0; warp < MAX_WARPS; warp++) {
                 for (int evt = 0; evt < profiler.event_counts[warp]; evt++) {
                     const EventData &event = profiler.events[warp][evt];
                     if (event.valid) {
-                        if (sm_min_time.find(event.smid) == sm_min_time.end()) {
-                            sm_min_time[event.smid] = event.start_time;
-                        } else {
-                            sm_min_time[event.smid] = std::min(sm_min_time[event.smid], event.start_time);
-                        }
+                        global_min_time = std::min(global_min_time, event.start_time_global);
                     }
                 }
             }
@@ -226,25 +241,23 @@ struct __align__(16) Profiler {
                     const EventData &event = profiler.events[warp][evt];
                     if (!event.valid) continue;
 
-                    // Convert clock64 cycles to microseconds relative to per-SM start
-                    // clock_rate_khz is in kHz, so cycles * 1000.0 / clock_rate_khz = microseconds
-                    uint64_t sm_base = sm_min_time[event.smid];
-                    double start_us = static_cast<double>(event.start_time - sm_base) * 1000.0 / clock_rate_khz;
+                    // Use globaltimer (nanoseconds) for start time alignment across SMs
+                    // Normalize to global_min_time so trace starts at t=0
+                    double start_us = static_cast<double>(event.start_time_global - global_min_time) / 1000.0;
                     
-                    // Handle potential clock64 wraparound and sanity check
-                    // If end_time < start_time, the counter wrapped around
+                    // Use clock64 for precise duration measurement within same SM
+                    // clock_rate_khz is in kHz, so cycles * 1000.0 / clock_rate_khz = microseconds
                     double duration_us;
-                    if (event.end_time >= event.start_time) {
-                        uint64_t duration_cycles = event.end_time - event.start_time;
+                    if (event.end_time_clock >= event.start_time_clock) {
+                        uint64_t duration_cycles = event.end_time_clock - event.start_time_clock;
                         duration_us = static_cast<double>(duration_cycles) * 1000.0 / clock_rate_khz;
                         
                         // Sanity check: if duration is unreasonably large (>1 second), likely corrupted data
-                        // This can happen if events aren't properly paired or clock64 has discontinuities
                         if (duration_us > 1000000.0) {  // > 1 second
                             duration_us = 0.0;
                         }
                     } else {
-                        // Wraparound occurred - duration would be negative, so clamp to 0
+                        // clock64 wraparound - should be extremely rare, treat as corrupted
                         duration_us = 0.0;
                     }
 
