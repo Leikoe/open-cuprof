@@ -44,15 +44,14 @@ __device__ __forceinline__ bool is_warp_leader() {
 
 // Event handle stores all data locally - no gmem writes until end()
 struct Event {
-    int id;
     const char* section_name;
     uint64_t start_time_ns;
     uint64_t start_time_clock;
     unsigned int smid;
     
-    __device__ __host__ Event() : id(-1), section_name(nullptr), 
+    __device__ __host__ Event() : section_name(nullptr), 
                                    start_time_ns(0), start_time_clock(0), smid(0) {}
-    __device__ __host__ bool is_valid() const { return id >= 0; }
+    __device__ __host__ bool is_valid() const { return section_name != nullptr; }
 };
 
 /**
@@ -113,19 +112,6 @@ struct __align__(16) Profiler {
      * @return Event handle to pass to end() 
      */
     __device__ inline Event start(const char* section_name) {
-        unsigned int block_id;
-        asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(block_id));
-        
-        BlockState<MAX_EVENTS, MAX_WARPS> &state = block_states[block_id];
-        
-        unsigned int warp_id;
-        asm volatile("mov.u32 %0, %%warpid;" : "=r"(warp_id));
-        
-        if (warp_id >= MAX_WARPS) return Event();
-        
-        int idx = state.event_counts[warp_id];
-        if (idx >= MAX_EVENTS) return Event();  // Overflow protection
-        
         // Capture both globaltimer (for cross-SM sync) and clock64 (for precise duration)
         uint64_t global_time, clock_time;
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(global_time));
@@ -134,12 +120,8 @@ struct __align__(16) Profiler {
         unsigned int smid;
         asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
         
-        // Increment counter for next event
-        state.event_counts[warp_id]++;
-        
         // Return event with all data in registers
         Event e;
-        e.id = idx;
         e.section_name = section_name;
         e.start_time_ns = global_time;
         e.start_time_clock = clock_time;
@@ -164,13 +146,16 @@ struct __align__(16) Profiler {
         asm volatile("mov.u32 %0, %%warpid;" : "=r"(warp_id));
         
         if (warp_id >= MAX_WARPS) return;
-        if (event.id >= MAX_EVENTS) return;
+        
+        // Atomically reserve an index for this event
+        int idx = atomicAdd(&state.event_counts[warp_id], 1);
+        if (idx >= MAX_EVENTS) return;  // Overflow protection
         
         uint64_t end_clock;
         asm volatile("mov.u64 %0, %%clock64;" : "=l"(end_clock));
         
         // Write all event data to gmem in one go
-        typename BlockState<MAX_EVENTS, MAX_WARPS>::EventData &evt = state.events[warp_id][event.id];
+        typename BlockState<MAX_EVENTS, MAX_WARPS>::EventData &evt = state.events[warp_id][idx];
         evt.start_time_ns = event.start_time_ns;
         evt.start_time_clock = event.start_time_clock;
         evt.end_time_clock = end_clock;
