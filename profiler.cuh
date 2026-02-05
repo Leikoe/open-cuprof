@@ -18,12 +18,17 @@ __device__ __forceinline__ bool is_warp_leader() {
 }
 
 
-// Event handle type for type safety and clarity
+// Event handle stores all data locally - no gmem writes until end()
 struct Event {
     int id;
+    const char* section_name;
+    uint64_t start_time_global;
+    uint64_t start_time_clock;
+    unsigned int smid;
+    unsigned int block_id;
     
-    __device__ __host__ Event() : id(-1) {}
-    __device__ __host__ explicit Event(int i) : id(i) {}
+    __device__ __host__ Event() : id(-1), section_name(nullptr), start_time_global(0), 
+                                   start_time_clock(0), smid(0), block_id(0) {}
     __device__ __host__ bool is_valid() const { return id >= 0; }
 };
 
@@ -43,9 +48,9 @@ struct Event {
  * 3. Device side - record events from warp leader only:
  *
  *      if (cuprof::is_warp_leader()) {
- *          cuprof::Event id = myprofiler.start_event("compute");
+ *          cuprof::Event e = myprofiler.start("compute");
  *          // ... work ...
- *          myprofiler.end_event(id);
+ *          myprofiler.end(e);
  *      }
  *
  * 4. Host side - export and cleanup:
@@ -59,7 +64,6 @@ struct __align__(16) Profiler {
         uint64_t start_time_clock;   // clock64 cycles (for precise timing)
         uint64_t end_time_clock;     // clock64 cycles (for precise timing)
         const char* section_name;    // Pointer to device constant string
-        int valid;  // 1 if event is valid, 0 otherwise
         unsigned int smid;  // SM ID where this event was recorded
         unsigned int block_id;  // Block ID for reference
     };
@@ -80,10 +84,11 @@ struct __align__(16) Profiler {
 
     /**
      * @brief Start recording an event section. Call from warp leader only.
+     * No gmem writes - all data stored in returned Event handle.
      * @param section_name Pointer to device constant string
-     * @return Event handle to pass to end_event() 
+     * @return Event handle to pass to end() 
      */
-    __device__ inline Event start_event(const char* section_name) {
+    __device__ inline Event start(const char* section_name) {
         unsigned int block_id;
         asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(block_id));
         
@@ -107,33 +112,33 @@ struct __align__(16) Profiler {
         int idx = block_profiler.event_counts[warp_id];
         if (idx >= MAX_EVENTS) return Event();  // Overflow protection
         
-        // Capture clock64 for precise timing
+        // Capture all data in registers - no gmem writes
         uint64_t clock_time;
         asm volatile("mov.u64 %0, %%clock64;" : "=l"(clock_time));
         
         unsigned int smid;
         asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
         
-        // Use block-wide global time reference (initialized once per block)
-        // This avoids redundant globaltimer reads per warp
-        block_profiler.events[warp_id][idx].start_time_global = block_profiler.block_start_time_global;
-        block_profiler.events[warp_id][idx].start_time_clock = clock_time;
-        block_profiler.events[warp_id][idx].section_name = section_name;
-        block_profiler.events[warp_id][idx].end_time_clock = 0;
-        block_profiler.events[warp_id][idx].valid = 0;  // Not valid until ended
-        block_profiler.events[warp_id][idx].smid = smid;
-        block_profiler.events[warp_id][idx].block_id = block_id;
-        
-        // Increment counter and return the handle for this event
+        // Increment counter for next event
         block_profiler.event_counts[warp_id]++;
-        return Event(idx);
+        
+        // Return event with all data in registers
+        Event e;
+        e.id = idx;
+        e.section_name = section_name;
+        e.start_time_global = block_profiler.block_start_time_global;
+        e.start_time_clock = clock_time;
+        e.smid = smid;
+        e.block_id = block_id;
+        return e;
     }
 
     /**
      * @brief End recording an event section. Call from warp leader only.
-     * @param event Event handle returned by start_event()
+     * Writes all event data to gmem in one operation.
+     * @param event Event handle returned by start()
      */
-    __device__ inline void end_event(Event event) {
+    __device__ inline void end(Event event) {
         if (!event.is_valid()) return;  // Invalid event
         
         unsigned int block_id;
@@ -147,12 +152,17 @@ struct __align__(16) Profiler {
         if (warp_id >= MAX_WARPS) return;
         if (event.id >= MAX_EVENTS) return;
         
-        uint64_t clock_time;
-        asm volatile("mov.u64 %0, %%clock64;" : "=l"(clock_time));
+        uint64_t end_clock;
+        asm volatile("mov.u64 %0, %%clock64;" : "=l"(end_clock));
         
-        // Directly access the event by handle - no search needed
-        block_profiler.events[warp_id][event.id].end_time_clock = clock_time;
-        block_profiler.events[warp_id][event.id].valid = 1;
+        // Write all event data to gmem in one go
+        EventData &evt = block_profiler.events[warp_id][event.id];
+        evt.start_time_global = event.start_time_global;
+        evt.start_time_clock = event.start_time_clock;
+        evt.end_time_clock = end_clock;
+        evt.section_name = event.section_name;
+        evt.smid = event.smid;
+        evt.block_id = event.block_id;
     }
 
     /**
@@ -178,7 +188,7 @@ struct __align__(16) Profiler {
             for (int warp = 0; warp < MAX_WARPS; warp++) {
                 for (int evt = 0; evt < profiler.event_counts[warp]; evt++) {
                     const EventData &event = profiler.events[warp][evt];
-                    if (event.valid) {
+                    if (event.section_name != nullptr) {
                         unique_name_ptrs.insert(event.section_name);
                     }
                 }
@@ -223,7 +233,7 @@ struct __align__(16) Profiler {
             for (int warp = 0; warp < MAX_WARPS; warp++) {
                 for (int evt = 0; evt < profiler.event_counts[warp]; evt++) {
                     const EventData &event = profiler.events[warp][evt];
-                    if (event.valid) {
+                    if (event.section_name != nullptr) {
                         global_min_time = std::min(global_min_time, event.start_time_global);
                     }
                 }
@@ -239,7 +249,7 @@ struct __align__(16) Profiler {
             for (int warp = 0; warp < MAX_WARPS; warp++) {
                 for (int evt = 0; evt < profiler.event_counts[warp]; evt++) {
                     const EventData &event = profiler.events[warp][evt];
-                    if (!event.valid) continue;
+                    if (event.section_name == nullptr) continue;
 
                     // Use globaltimer (nanoseconds) for start time alignment across SMs
                     // Normalize to global_min_time so trace starts at t=0

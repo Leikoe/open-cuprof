@@ -24,101 +24,101 @@ __global__ void multi_warp_kernel(
     if (warp_id == 0) {
         // Warp 0: Vector addition
         cuprof::Event warp0_load_id;
-        if (is_warp_leader) warp0_load_id = myprofiler.start_event("warp0_load");
+        if (is_warp_leader) warp0_load_id = myprofiler.start("warp0_load");
         float a = (tid < n) ? input_a[tid] : 0.0f;
         float b = (tid < n) ? input_b[tid] : 0.0f;
-        if (is_warp_leader) myprofiler.end_event(warp0_load_id);
+        if (is_warp_leader) myprofiler.end(warp0_load_id);
         
         cuprof::Event warp0_add_id;
-        if (is_warp_leader) warp0_add_id = myprofiler.start_event("warp0_add");
+        if (is_warp_leader) warp0_add_id = myprofiler.start("warp0_add");
         float result = a + b;
-        if (is_warp_leader) myprofiler.end_event(warp0_add_id);
+        if (is_warp_leader) myprofiler.end(warp0_add_id);
         
         cuprof::Event warp0_store_id;
-        if (is_warp_leader) warp0_store_id = myprofiler.start_event("warp0_store");
+        if (is_warp_leader) warp0_store_id = myprofiler.start("warp0_store");
         if (tid < n) output[tid] = result;
-        if (is_warp_leader) myprofiler.end_event(warp0_store_id);
+        if (is_warp_leader) myprofiler.end(warp0_store_id);
         
     } else if (warp_id == 1) {
         // Warp 1: Vector multiplication with heavy compute loop
         cuprof::Event warp1_load_id;
-        if (is_warp_leader) warp1_load_id = myprofiler.start_event("warp1_load");
+        if (is_warp_leader) warp1_load_id = myprofiler.start("warp1_load");
         float a = (tid < n) ? input_a[tid] : 0.0f;
         float b = (tid < n) ? input_b[tid] : 0.0f;
-        if (is_warp_leader) myprofiler.end_event(warp1_load_id);
+        if (is_warp_leader) myprofiler.end(warp1_load_id);
         
         cuprof::Event warp1_multiply_id;
-        if (is_warp_leader) warp1_multiply_id = myprofiler.start_event("warp1_multiply");
+        if (is_warp_leader) warp1_multiply_id = myprofiler.start("warp1_multiply");
         float result = a * b;
-        if (is_warp_leader) myprofiler.end_event(warp1_multiply_id);
+        if (is_warp_leader) myprofiler.end(warp1_multiply_id);
         
         cuprof::Event warp1_heavy_compute_id;
-        if (is_warp_leader) warp1_heavy_compute_id = myprofiler.start_event("warp1_heavy_compute");
+        if (is_warp_leader) warp1_heavy_compute_id = myprofiler.start("warp1_heavy_compute");
         // Heavy computation loop to show measurable duration
         #pragma unroll 1
         for (int i = 0; i < 100; i++) {
             result = sqrtf(result * result + 1.0f);
         }
-        if (is_warp_leader) myprofiler.end_event(warp1_heavy_compute_id);
+        if (is_warp_leader) myprofiler.end(warp1_heavy_compute_id);
         
         cuprof::Event warp1_store_id;
-        if (is_warp_leader) warp1_store_id = myprofiler.start_event("warp1_store");
+        if (is_warp_leader) warp1_store_id = myprofiler.start("warp1_store");
         if (tid < n) output[tid] = result;
-        if (is_warp_leader) myprofiler.end_event(warp1_store_id);
+        if (is_warp_leader) myprofiler.end(warp1_store_id);
         
     } else if (warp_id == 2) {
         // Warp 2: Iterative computation with sync
         cuprof::Event warp2_load_id;
-        if (is_warp_leader) warp2_load_id = myprofiler.start_event("warp2_load");
+        if (is_warp_leader) warp2_load_id = myprofiler.start("warp2_load");
         float a = (tid < n) ? input_a[tid] : 0.0f;
         float b = (tid < n) ? input_b[tid] : 0.0f;
-        if (is_warp_leader) myprofiler.end_event(warp2_load_id);
+        if (is_warp_leader) myprofiler.end(warp2_load_id);
         
         cuprof::Event warp2_compute_id;
-        if (is_warp_leader) warp2_compute_id = myprofiler.start_event("warp2_compute");
+        if (is_warp_leader) warp2_compute_id = myprofiler.start("warp2_compute");
         float result = a;
         #pragma unroll 1
         for (int i = 0; i < 50; i++) {
             result = expf(result * 0.01f) * b;
         }
-        if (is_warp_leader) myprofiler.end_event(warp2_compute_id);
+        if (is_warp_leader) myprofiler.end(warp2_compute_id);
         
         cuprof::Event warp2_sync_id;
-        if (is_warp_leader) warp2_sync_id = myprofiler.start_event("warp2_sync");
+        if (is_warp_leader) warp2_sync_id = myprofiler.start("warp2_sync");
         __syncthreads();
-        if (is_warp_leader) myprofiler.end_event(warp2_sync_id);
+        if (is_warp_leader) myprofiler.end(warp2_sync_id);
         
         cuprof::Event warp2_store_id;
-        if (is_warp_leader) warp2_store_id = myprofiler.start_event("warp2_store");
+        if (is_warp_leader) warp2_store_id = myprofiler.start("warp2_store");
         if (tid < n) output[tid] = result;
-        if (is_warp_leader) myprofiler.end_event(warp2_store_id);
+        if (is_warp_leader) myprofiler.end(warp2_store_id);
         
     } else if (warp_id == 3) {
         // Warp 3: Transcendental function heavy workload
         cuprof::Event warp3_load_id;
-        if (is_warp_leader) warp3_load_id = myprofiler.start_event("warp3_load");
+        if (is_warp_leader) warp3_load_id = myprofiler.start("warp3_load");
         float a = (tid < n) ? input_a[tid] : 0.0f;
         float b = (tid < n) ? input_b[tid] : 0.0f;
-        if (is_warp_leader) myprofiler.end_event(warp3_load_id);
+        if (is_warp_leader) myprofiler.end(warp3_load_id);
         
         cuprof::Event warp3_trig_compute_id;
-        if (is_warp_leader) warp3_trig_compute_id = myprofiler.start_event("warp3_trig_compute");
+        if (is_warp_leader) warp3_trig_compute_id = myprofiler.start("warp3_trig_compute");
         float result = 0.0f;
         #pragma unroll 1
         for (int i = 0; i < 30; i++) {
             result += sinf(a * 0.1f * i) * cosf(b * 0.1f * i);
         }
-        if (is_warp_leader) myprofiler.end_event(warp3_trig_compute_id);
+        if (is_warp_leader) myprofiler.end(warp3_trig_compute_id);
         
         cuprof::Event warp3_finalize_id;
-        if (is_warp_leader) warp3_finalize_id = myprofiler.start_event("warp3_finalize");
+        if (is_warp_leader) warp3_finalize_id = myprofiler.start("warp3_finalize");
         result = logf(fabsf(result) + 1.0f);
-        if (is_warp_leader) myprofiler.end_event(warp3_finalize_id);
+        if (is_warp_leader) myprofiler.end(warp3_finalize_id);
         
         cuprof::Event warp3_store_id;
-        if (is_warp_leader) warp3_store_id = myprofiler.start_event("warp3_store");
+        if (is_warp_leader) warp3_store_id = myprofiler.start("warp3_store");
         if (tid < n) output[tid] = result;
-        if (is_warp_leader) myprofiler.end_event(warp3_store_id);
+        if (is_warp_leader) myprofiler.end(warp3_store_id);
     }
 }
 

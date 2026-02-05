@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 2. **Simplest Possible Code**: The implementation should be as straightforward as possible. Avoid clever optimizations, complex data structures, or abstraction layers. Simple, readable code is easier to verify for correctness and performance.
 
-3. **No Loops in Hot Path**: Device-side functions (`start_event()`, `end_event()`) must not contain loops or searches. These functions are called frequently within performance-critical kernels.
+3. **No Loops in Hot Path**: Device-side functions (`start()`, `end()`) must not contain loops or searches. These functions are called frequently within performance-critical kernels.
 
 4. **Verify Generated Code**: When making changes to device-side code, always check the generated PTX/SASS to ensure no unexpected overhead is introduced.
 
@@ -54,9 +54,9 @@ Run examples:
   - `MAX_EVENTS`: Maximum events per warp per block (default: 128)
   - `MAX_WARPS`: Maximum warps to track per block (default: 32)
 - Types:
-  - `cuprof::Event` - Event handle returned by `start_event()` and passed to `end_event()`
-  - `cuprof::EventData` - Internal struct for storing event data
-- Device-side API: `start_event()`, `end_event()` called from warp leaders only
+  - `cuprof::Event` - Event handle returned by `start()` and passed to `end()`. Stores all timing data locally in registers until `end()` is called.
+  - `cuprof::EventData` - Internal struct for storing event data in global memory
+- Device-side API: `start()`, `end()` called from warp leaders only
 - Host-side API: `cuprof::init()`, `cuprof::export_and_cleanup()`
 - Helper: `cuprof::is_warp_leader()` - PTX-based check for lane 0
 
@@ -71,12 +71,12 @@ __device__ cuprof::Profiler<512, 1> myprofiler;
 
 **String Literal Handling**: Section names are passed as `const char*` pointers to device constant strings. Export code reads these byte-by-byte from device memory to avoid over-reading.
 
-**Event Handle Pattern**: `start_event()` returns a `cuprof::Event` handle that must be passed to `end_event()`. This enables zero-overhead nested events through direct array indexing:
+**Event Handle Pattern**: `start()` returns a `cuprof::Event` handle that stores all timing data locally in registers. Only when `end()` is called is the complete event written to global memory in a single operation. This reduces memory traffic by 2x compared to writing on both start and end:
 ```cpp
 if (cuprof::is_warp_leader()) {
-    cuprof::Event event = myprofiler.start_event("section_name");
+    cuprof::Event e = myprofiler.start("section_name");
     // ... work ...
-    myprofiler.end_event(event);
+    myprofiler.end(e);
 }
 ```
 
@@ -158,8 +158,8 @@ When adding new features to `profiler.cuh`:
   - Start times use shared globaltimer for cross-SM coherence
   - Durations use clock64 delta for high precision
   - Only one `%globaltimer` read per block (amortized cost across all warps)
-- **Event overflow**: Both `start_event()` and `end_event()` include bounds checking (`if (idx >= MAX_EVENTS) return`)
-- **Event validity**: Events are only marked valid (`.valid = 1`) when `end_event()` is called
+- **Event overflow**: Both `start()` and `end()` include bounds checking (`if (idx >= MAX_EVENTS) return`)
+- **Memory optimization**: `start()` captures all data in registers (no gmem writes), `end()` writes everything to gmem in one operation (2x reduction in memory traffic)
 - **Timestamp conversion**: 
   - Start times: `%globaltimer` nanoseconds normalized to global minimum
   - Durations: `%clock64` cycle deltas converted using GPU clock rate
