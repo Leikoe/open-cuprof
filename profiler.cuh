@@ -22,7 +22,6 @@ struct BlockState {
         uint64_t end_time_clock;     // clock64 cycles (for precise timing)
         const char* section_name;    // Pointer to device constant string
         unsigned int smid;  // SM ID where this event was recorded
-        unsigned int block_id;  // Block ID for reference
     };
 
     // Per-warp event storage
@@ -50,10 +49,9 @@ struct Event {
     uint64_t start_time_global;
     uint64_t start_time_clock;
     unsigned int smid;
-    unsigned int block_id;
     
     __device__ __host__ Event() : id(-1), section_name(nullptr), start_time_global(0), 
-                                   start_time_clock(0), smid(0), block_id(0) {}
+                                   start_time_clock(0), smid(0) {}
     __device__ __host__ bool is_valid() const { return id >= 0; }
 };
 
@@ -152,7 +150,6 @@ struct __align__(16) Profiler {
         e.start_time_global = global_time_now;
         e.start_time_clock = clock_time;
         e.smid = smid;
-        e.block_id = block_id;
         return e;
     }
 
@@ -185,7 +182,6 @@ struct __align__(16) Profiler {
         evt.end_time_clock = end_clock;
         evt.section_name = event.section_name;
         evt.smid = event.smid;
-        evt.block_id = event.block_id;
     }
 
     /**
@@ -316,7 +312,7 @@ struct __align__(16) Profiler {
                     out << "    \"dur\": " << duration_us << ",\n";
                     out << "    \"pid\": " << event.smid << ",\n";  // Process = SM
                     out << "    \"tid\": " << warp << ",\n";   // Thread = warp
-                    out << "    \"args\": {\"block\": " << event.block_id << ", \"smid\": " << event.smid << "}\n";
+                    out << "    \"args\": {\"block\": " << block << ", \"smid\": " << event.smid << "}\n";
                     out << "  }";
                 }
             }
