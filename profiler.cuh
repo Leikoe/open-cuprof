@@ -302,11 +302,14 @@ struct __align__(16) Profiler {
                     out << "    \"name\": \"" << section_name << "\",\n";
                     out << "    \"cat\": \"kernel\",\n";
                     out << "    \"ph\": \"X\",\n";  // Complete event (duration)
+                    // Compute global warp ID: block_id * warps_per_block + local_warp_id
+                    int global_warp_id = block * MAX_WARPS + warp;
+                    
                     out << "    \"ts\": " << std::fixed << std::setprecision(6) << start_us << ",\n";
                     out << "    \"dur\": " << std::fixed << std::setprecision(6) << duration_us << ",\n";
-                    out << "    \"pid\": " << event.smid << ",\n";  // Process = SM
-                    out << "    \"tid\": " << warp << ",\n";   // Thread = warp
-                    out << "    \"args\": {\"block\": " << block << ", \"smid\": " << event.smid << "}\n";
+                    out << "    \"pid\": " << event.smid << ",\n";  // Process = SM ID
+                    out << "    \"tid\": " << global_warp_id << ",\n";   // Thread = global warp ID
+                    out << "    \"args\": {\"block\": " << block << ", \"warp\": " << warp << ", \"smid\": " << event.smid << "}\n";
                     out << "  }";
                 }
             }
