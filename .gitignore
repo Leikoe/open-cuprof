@@ -24,3 +24,4 @@ flash_attention_example
 
 # extra docs
 parallel-thread-execution.md
+gaunenrst-profiler.cuh

@@ -19,8 +19,9 @@ template <int MAX_EVENTS, int MAX_WARPS> struct Profiler;
 template <int MAX_EVENTS = 128, int MAX_WARPS = 32>
 struct BlockState {
     struct EventData {
-        uint64_t start_time_clock;   // clock64 cycles (for precise timing)
-        uint64_t end_time_clock;     // clock64 cycles (for precise timing)
+        uint64_t start_time_ns;      // globaltimer nanoseconds (for cross-SM sync)
+        uint64_t start_time_clock;   // clock64 cycles (for precise duration)
+        uint64_t end_time_clock;     // clock64 cycles (for precise duration)
         const char* section_name;    // Pointer to device constant string
         unsigned int smid;  // SM ID where this event was recorded
     };
@@ -29,9 +30,7 @@ struct BlockState {
     EventData events[MAX_WARPS][MAX_EVENTS];
     int event_counts[MAX_WARPS];  // Number of events recorded per warp
     
-    // Block-wide time references (captured once on first start)
-    uint64_t block_start_time_global;  // globaltimer reference
-    uint64_t block_start_time_clock;   // clock64 reference (same moment as global)
+    // Block initialization - we don't actually need this anymore since we store absolute times
     int initialized;
 };
 
@@ -47,11 +46,12 @@ __device__ __forceinline__ bool is_warp_leader() {
 struct Event {
     int id;
     const char* section_name;
+    uint64_t start_time_ns;
     uint64_t start_time_clock;
     unsigned int smid;
     
     __device__ __host__ Event() : id(-1), section_name(nullptr), 
-                                   start_time_clock(0), smid(0) {}
+                                   start_time_ns(0), start_time_clock(0), smid(0) {}
     __device__ __host__ bool is_valid() const { return id >= 0; }
 };
 
@@ -101,8 +101,6 @@ struct __align__(16) Profiler {
         BlockState<MAX_EVENTS, MAX_WARPS> &state = block_states[block_id];
         
         if (threadIdx.x == 0) {
-            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(state.block_start_time_global));
-            asm volatile("mov.u64 %0, %%clock64;" : "=l"(state.block_start_time_clock));
             state.initialized = 1;
         }
         __syncthreads();
@@ -128,8 +126,9 @@ struct __align__(16) Profiler {
         int idx = state.event_counts[warp_id];
         if (idx >= MAX_EVENTS) return Event();  // Overflow protection
         
-        // Capture clock64 only - no globaltimer read per event (optimization)
-        uint64_t clock_time;
+        // Capture both globaltimer (for cross-SM sync) and clock64 (for precise duration)
+        uint64_t global_time, clock_time;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(global_time));
         asm volatile("mov.u64 %0, %%clock64;" : "=l"(clock_time));
         
         unsigned int smid;
@@ -142,6 +141,7 @@ struct __align__(16) Profiler {
         Event e;
         e.id = idx;
         e.section_name = section_name;
+        e.start_time_ns = global_time;
         e.start_time_clock = clock_time;
         e.smid = smid;
         return e;
@@ -171,6 +171,7 @@ struct __align__(16) Profiler {
         
         // Write all event data to gmem in one go
         typename BlockState<MAX_EVENTS, MAX_WARPS>::EventData &evt = state.events[warp_id][event.id];
+        evt.start_time_ns = event.start_time_ns;
         evt.start_time_clock = event.start_time_clock;
         evt.end_time_clock = end_clock;
         evt.section_name = event.section_name;
@@ -238,31 +239,23 @@ struct __align__(16) Profiler {
         int clock_rate_khz;
         cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate, device);
         
-        // Find global minimum event start time for normalization (in nanoseconds)
-        // We need to compute event start times from block references first
-        double global_min_time_ns = std::numeric_limits<double>::max();
+        // Find minimum start_time_ns across all events (globaltimer is synchronized across SMs)
+        uint64_t global_min_time_ns = UINT64_MAX;
         for (int block = 0; block < num_blocks; block++) {
             const BlockState<MAX_EVENTS, MAX_WARPS> &state = h_block_states[block];
-            if (!state.initialized) continue;
-            
             for (int warp = 0; warp < MAX_WARPS; warp++) {
                 for (int evt = 0; evt < state.event_counts[warp]; evt++) {
                     const typename BlockState<MAX_EVENTS, MAX_WARPS>::EventData &event = state.events[warp][evt];
-                    if (event.section_name == nullptr) continue;
-                    
-                    // Compute this event's global start time in nanoseconds (floating point for precision)
-                    uint64_t clock_delta_cycles = event.start_time_clock - state.block_start_time_clock;
-                    double clock_delta_ns = static_cast<double>(clock_delta_cycles) * 1000000.0 / clock_rate_khz;
-                    double event_start_time_ns = static_cast<double>(state.block_start_time_global) + clock_delta_ns;
-                    
-                    global_min_time_ns = std::min(global_min_time_ns, event_start_time_ns);
+                    if (event.section_name != nullptr && event.start_time_ns > 0) {
+                        global_min_time_ns = std::min(global_min_time_ns, event.start_time_ns);
+                    }
                 }
             }
         }
         
-        // If no valid events found, set to 0 to avoid issues
-        if (global_min_time_ns == std::numeric_limits<double>::max()) {
-            global_min_time_ns = 0.0;
+        // If no valid events found, set to 0
+        if (global_min_time_ns == UINT64_MAX) {
+            global_min_time_ns = 0;
         }
 
         out << "[\n";
@@ -276,13 +269,9 @@ struct __align__(16) Profiler {
                     const typename BlockState<MAX_EVENTS, MAX_WARPS>::EventData &event = state.events[warp][evt];
                     if (event.section_name == nullptr) continue;
 
-                    // Compute event's global start time from clock delta (in nanoseconds, floating point for precision)
-                    uint64_t clock_delta_cycles = event.start_time_clock - state.block_start_time_clock;
-                    double clock_delta_ns = static_cast<double>(clock_delta_cycles) * 1000000.0 / clock_rate_khz;
-                    double event_start_time_ns = static_cast<double>(state.block_start_time_global) + clock_delta_ns;
-                    
-                    // Normalize to global_min_time_ns and convert to microseconds
-                    double start_us = (event_start_time_ns - global_min_time_ns) / 1000.0;
+                    // Use globaltimer for timestamp (cross-SM synchronized), clock64 for duration
+                    // Timestamp: globaltimer normalized to minimum (nanoseconds -> microseconds)
+                    double start_us = static_cast<double>(event.start_time_ns - global_min_time_ns) / 1000.0;
                     
                     // Use clock64 for precise duration measurement within same SM
                     // clock_rate_khz is in kHz, so cycles * 1000.0 / clock_rate_khz = microseconds
