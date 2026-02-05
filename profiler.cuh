@@ -10,6 +10,19 @@
 
 namespace cuprof {
 
+// Block-wide state for lazy initialization of global timer (in shared memory)
+struct BlockState {
+    uint64_t block_start_time_global;
+    int initialized;
+    
+    __device__ void init() {
+        if (threadIdx.x == 0) {
+            initialized = 0;
+        }
+        __syncthreads();
+    }
+};
+
 // Helper to check if current thread is warp leader
 __device__ __forceinline__ bool is_warp_leader() {
     unsigned int lane_id;
@@ -45,10 +58,13 @@ struct Event {
  *
  *      cuprof::init(&myprofiler, num_blocks);
  *
- * 3. Device side - record events from warp leader only:
+ * 3. Device side - declare shared memory and record events:
+ *
+ *      __shared__ cuprof::BlockState block_state;
+ *      block_state.init();
  *
  *      if (cuprof::is_warp_leader()) {
- *          cuprof::Event e = myprofiler.start("compute");
+ *          cuprof::Event e = myprofiler.start("compute", &block_state);
  *          // ... work ...
  *          myprofiler.end(e);
  *      }
@@ -71,10 +87,6 @@ struct __align__(16) Profiler {
     // Per-warp event storage
     EventData events[MAX_WARPS][MAX_EVENTS];
     int event_counts[MAX_WARPS];  // Number of events recorded per warp
-
-    // Block-wide global time reference (captured once on first start_event)
-    uint64_t block_start_time_global;
-    int block_time_initialized;  // 0 = not initialized, 1 = initialized
     
     // Device pointer to per-block data
     Profiler *block_data;
@@ -86,9 +98,10 @@ struct __align__(16) Profiler {
      * @brief Start recording an event section. Call from warp leader only.
      * No gmem writes - all data stored in returned Event handle.
      * @param section_name Pointer to device constant string
+     * @param block_state Pointer to __shared__ BlockState
      * @return Event handle to pass to end() 
      */
-    __device__ inline Event start(const char* section_name) {
+    __device__ inline Event start(const char* section_name, BlockState* block_state) {
         unsigned int block_id;
         asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(block_id));
         
@@ -99,13 +112,13 @@ struct __align__(16) Profiler {
         
         if (warp_id >= MAX_WARPS) return Event();
         
-        // Initialize block global time reference on first call (lazy initialization)
-        // Using atomicCAS ensures only one warp initializes it
-        if (block_profiler.block_time_initialized == 0) {
-            if (atomicCAS(&block_profiler.block_time_initialized, 0, 1) == 0) {
+        // Initialize block global time reference on first call (lazy initialization in smem)
+        // Using atomicCAS on shared memory ensures only one warp initializes it
+        if (block_state->initialized == 0) {
+            if (atomicCAS(&block_state->initialized, 0, 1) == 0) {
                 uint64_t global_time;
                 asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(global_time));
-                block_profiler.block_start_time_global = global_time;
+                block_state->block_start_time_global = global_time;
             }
         }
         
@@ -126,7 +139,7 @@ struct __align__(16) Profiler {
         Event e;
         e.id = idx;
         e.section_name = section_name;
-        e.start_time_global = block_profiler.block_start_time_global;
+        e.start_time_global = block_state->block_start_time_global;
         e.start_time_clock = clock_time;
         e.smid = smid;
         e.block_id = block_id;
