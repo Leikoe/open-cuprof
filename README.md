@@ -23,6 +23,7 @@ __device__ cuprof::Profiler<512, 1> myprofiler;
 ```
 
 Record events from inside your kernel:
+
  **IMPORTANT:** only the leader of each warp can record events
 ```cpp
 __global__ void my_kernel() {
