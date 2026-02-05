@@ -41,6 +41,15 @@ __device__ __forceinline__ bool is_warp_leader() {
     return lane_id == 0;
 }
 
+// Helper to check if current thread is CTA (block) leader
+__device__ __forceinline__ bool is_cta_leader() {
+    unsigned int tid_x, tid_y, tid_z;
+    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(tid_x));
+    asm volatile("mov.u32 %0, %%tid.y;" : "=r"(tid_y));
+    asm volatile("mov.u32 %0, %%tid.z;" : "=r"(tid_z));
+    return (tid_x | tid_y | tid_z) == 0;
+}
+
 
 // Event handle stores all data locally - no gmem writes until end()
 struct Event {
@@ -88,7 +97,7 @@ struct __align__(16) Profiler {
 
     /**
      * @brief Initialize block state. Call once per block, before any profiling.
-     * Should be called by one thread (e.g., threadIdx.x == 0) with a __syncthreads() after.
+     * Should be called by one thread (e.g., CTA leader) with a __syncthreads() after.
      */
     __device__ inline void block_init() {
         unsigned int block_id;
@@ -96,7 +105,7 @@ struct __align__(16) Profiler {
         
         BlockState<MAX_EVENTS, MAX_WARPS> &state = block_states[block_id];
         
-        if (threadIdx.x == 0) {
+        if (is_cta_leader()) {
             // Capture SM ID once for entire block
             unsigned int smid;
             asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
