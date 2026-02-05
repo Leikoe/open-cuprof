@@ -17,6 +17,7 @@ __global__ void nested_events_kernel(
     int n,
     int num_iterations
 ) {
+    myprofiler.block_init();
 
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     bool is_warp_leader = cuprof::is_warp_leader();

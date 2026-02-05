@@ -20,6 +20,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
                                  double *B, // (K, N)
                                  double *C  // (M, N)
 ) {
+    myprofiler.block_init();
 
     int block_m = blockIdx.x;
     int block_n = blockIdx.y;

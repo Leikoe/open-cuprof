@@ -70,7 +70,9 @@ struct Event {
  *
  *      cuprof::init(&myprofiler, num_blocks);
  *
- * 3. Device side - record events:
+ * 3. Device side - initialize and record events:
+ *
+ *      myprofiler.block_init();  // Call once at kernel start
  *
  *      if (cuprof::is_warp_leader()) {
  *          cuprof::Event e = myprofiler.start("compute");
@@ -91,6 +93,24 @@ struct __align__(16) Profiler {
     int num_blocks;
 
     /**
+     * @brief Initialize block state. Call once per block, before any profiling.
+     * Should be called by one thread (e.g., threadIdx.x == 0) with a __syncthreads() after.
+     */
+    __device__ inline void block_init() {
+        unsigned int block_id;
+        asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(block_id));
+        
+        BlockState<MAX_EVENTS, MAX_WARPS> &state = block_states[block_id];
+        
+        if (threadIdx.x == 0) {
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(state.block_start_time_global));
+            asm volatile("mov.u64 %0, %%clock64;" : "=l"(state.block_start_time_clock));
+            state.initialized = 1;
+        }
+        __syncthreads();
+    }
+
+    /**
      * @brief Start recording an event section. Call from warp leader only.
      * No gmem writes - all data stored in returned Event handle.
      * @param section_name Pointer to device constant string
@@ -106,19 +126,6 @@ struct __align__(16) Profiler {
         asm volatile("mov.u32 %0, %%warpid;" : "=r"(warp_id));
         
         if (warp_id >= MAX_WARPS) return Event();
-        
-        // Initialize block time references on first call (lazy initialization)
-        // Capture both globaltimer and clock64 at the same moment for correlation
-        // Using atomicCAS ensures only one warp initializes it
-        if (state.initialized == 0) {
-            if (atomicCAS(&state.initialized, 0, 1) == 0) {
-                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(state.block_start_time_global));
-                asm volatile("mov.u64 %0, %%clock64;" : "=l"(state.block_start_time_clock));
-                __threadfence();  // Ensure writes are visible to all threads
-            }
-            // Spin until initialization is complete (initialized becomes 1)
-            while (state.initialized == 0);
-        }
         
         int idx = state.event_counts[warp_id];
         if (idx >= MAX_EVENTS) return Event();  // Overflow protection

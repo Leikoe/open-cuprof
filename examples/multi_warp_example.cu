@@ -14,6 +14,7 @@ __global__ void multi_warp_kernel(
     float *output,
     int n
 ) {
+    myprofiler.block_init();
 
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     unsigned int warp_id;

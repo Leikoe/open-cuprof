@@ -40,6 +40,7 @@ __global__ void flash_attention_v2_kernel(
     int N,           // sequence length
     float scale      // 1/sqrt(d)
 ) {
+    flash_profiler.block_init();
 
     // Block processes Br rows of Q
     int block_row_start = blockIdx.x * Br;

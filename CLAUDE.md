@@ -72,8 +72,10 @@ __device__ cuprof::Profiler<512, 1> myprofiler;
 
 **String Literal Handling**: Section names are passed as `const char*` pointers to device constant strings. Export code reads these byte-by-byte from device memory to avoid over-reading.
 
-**Event Handle Pattern**: `start()` returns a `cuprof::Event` handle that stores all timing data locally in registers. Only when `end()` is called is the complete event written to global memory in a single operation. This reduces memory traffic by 2x compared to writing on both start and end:
+**Event Handle Pattern**: `start()` returns a `cuprof::Event` handle that stores all timing data locally in registers. Only when `end()` is called is the complete event written to global memory in a single operation. This reduces memory traffic by 2x compared to writing on both start and end. Requires calling `block_init()` once at kernel start:
 ```cpp
+myprofiler.block_init();  // Once at kernel start
+
 if (cuprof::is_warp_leader()) {
     cuprof::Event e = myprofiler.start("section_name");
     // ... work ...
@@ -153,12 +155,12 @@ When adding new features to `profiler.cuh`:
 
 - **Device-side methods**: Must use PTX inline assembly for special registers (`%laneid`, `%warpid`, `%ctaid.x`, `%smid`, `%globaltimer`, `%clock64`)
 - **Hybrid timing approach** (optimized for minimal overhead): 
-  - `%globaltimer` captured once per block via lazy initialization with `atomicCAS`
-  - All warps in a block share the same global time reference (stored in per-block `BlockState`)
+  - `%globaltimer` and `%clock64` captured once per block in `block_init()`
+  - Per-event timestamps computed as: `block_global + (clock_now - block_clock)`
   - `%clock64` provides precise duration measurement (cycle-level precision)
-  - Start times use shared globaltimer for cross-SM coherence
+  - Start times use globaltimer-based estimation for cross-SM coherence
   - Durations use clock64 delta for high precision
-  - Only one `%globaltimer` read per block (amortized cost across all warps)
+  - Only one `%globaltimer` read per block (zero overhead in `start()`/`end()`)
 - **Event overflow**: Both `start()` and `end()` include bounds checking (`if (idx >= MAX_EVENTS) return`)
 - **Memory optimization**: `start()` captures all data in registers (no gmem writes), `end()` writes everything to gmem in one operation (2x reduction in memory traffic)
 - **Timestamp conversion**: 
