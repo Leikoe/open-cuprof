@@ -7,6 +7,8 @@
 #include <vector>
 #include <unordered_map>
 #include <set>
+#include <limits>
+#include <iomanip>
 
 namespace cuprof {
 
@@ -236,9 +238,9 @@ struct __align__(16) Profiler {
         int clock_rate_khz;
         cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate, device);
         
-        // Find global minimum event start time for normalization
+        // Find global minimum event start time for normalization (in nanoseconds)
         // We need to compute event start times from block references first
-        uint64_t global_min_time = UINT64_MAX;
+        double global_min_time_ns = std::numeric_limits<double>::max();
         for (int block = 0; block < num_blocks; block++) {
             const BlockState<MAX_EVENTS, MAX_WARPS> &state = h_block_states[block];
             if (!state.initialized) continue;
@@ -248,18 +250,19 @@ struct __align__(16) Profiler {
                     const typename BlockState<MAX_EVENTS, MAX_WARPS>::EventData &event = state.events[warp][evt];
                     if (event.section_name == nullptr) continue;
                     
-                    // Compute this event's global start time
-                    uint64_t clock_delta = event.start_time_clock - state.block_start_time_clock;
-                    uint64_t event_start_time_global = state.block_start_time_global + clock_delta;
+                    // Compute this event's global start time in nanoseconds (floating point for precision)
+                    uint64_t clock_delta_cycles = event.start_time_clock - state.block_start_time_clock;
+                    double clock_delta_ns = static_cast<double>(clock_delta_cycles) * 1000000.0 / clock_rate_khz;
+                    double event_start_time_ns = static_cast<double>(state.block_start_time_global) + clock_delta_ns;
                     
-                    global_min_time = std::min(global_min_time, event_start_time_global);
+                    global_min_time_ns = std::min(global_min_time_ns, event_start_time_ns);
                 }
             }
         }
         
-        // If no valid events found, set to 0 to avoid underflow
-        if (global_min_time == UINT64_MAX) {
-            global_min_time = 0;
+        // If no valid events found, set to 0 to avoid issues
+        if (global_min_time_ns == std::numeric_limits<double>::max()) {
+            global_min_time_ns = 0.0;
         }
 
         out << "[\n";
@@ -273,13 +276,13 @@ struct __align__(16) Profiler {
                     const typename BlockState<MAX_EVENTS, MAX_WARPS>::EventData &event = state.events[warp][evt];
                     if (event.section_name == nullptr) continue;
 
-                    // Compute event's global start time from clock delta
-                    // This uses the block's reference times to convert clock64 to globaltimer
-                    uint64_t clock_delta = event.start_time_clock - state.block_start_time_clock;
-                    uint64_t event_start_time_global = state.block_start_time_global + clock_delta;
+                    // Compute event's global start time from clock delta (in nanoseconds, floating point for precision)
+                    uint64_t clock_delta_cycles = event.start_time_clock - state.block_start_time_clock;
+                    double clock_delta_ns = static_cast<double>(clock_delta_cycles) * 1000000.0 / clock_rate_khz;
+                    double event_start_time_ns = static_cast<double>(state.block_start_time_global) + clock_delta_ns;
                     
-                    // Normalize to global_min_time so trace starts at t=0
-                    double start_us = static_cast<double>(event_start_time_global - global_min_time) / 1000.0;
+                    // Normalize to global_min_time_ns and convert to microseconds
+                    double start_us = (event_start_time_ns - global_min_time_ns) / 1000.0;
                     
                     // Use clock64 for precise duration measurement within same SM
                     // clock_rate_khz is in kHz, so cycles * 1000.0 / clock_rate_khz = microseconds
@@ -310,8 +313,8 @@ struct __align__(16) Profiler {
                     out << "    \"name\": \"" << section_name << "\",\n";
                     out << "    \"cat\": \"kernel\",\n";
                     out << "    \"ph\": \"X\",\n";  // Complete event (duration)
-                    out << "    \"ts\": " << start_us << ",\n";
-                    out << "    \"dur\": " << duration_us << ",\n";
+                    out << "    \"ts\": " << std::fixed << std::setprecision(6) << start_us << ",\n";
+                    out << "    \"dur\": " << std::fixed << std::setprecision(6) << duration_us << ",\n";
                     out << "    \"pid\": " << event.smid << ",\n";  // Process = SM
                     out << "    \"tid\": " << warp << ",\n";   // Thread = warp
                     out << "    \"args\": {\"block\": " << block << ", \"smid\": " << event.smid << "}\n";
