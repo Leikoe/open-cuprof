@@ -6,6 +6,8 @@ This file provides guidance to AI coding agents (Claude, Gemini, etc.) when work
 
 **open-cuprof** is a lightweight, single-file, header-only profiler for CUDA kernels with Chrome Trace/Perfetto export. The profiler uses PTX special registers (`%laneid`, `%warpid`, `%ctaid`, `%smid`, `%globaltimer`, `%clock64`) for minimal overhead and supports per-warp event tracking without requiring kernel signature changes.
 
+**PTX Documentation**: Full PTX (Parallel Thread Execution) ISA reference is available at `./parallel-thread-execution.md` for details on special registers and inline assembly syntax.
+
 ## Core Design Principles
 
 **CRITICAL - Read this before making any changes:**
