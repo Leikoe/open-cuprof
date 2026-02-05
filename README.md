@@ -27,12 +27,13 @@ Record events from inside your kernel:
  **IMPORTANT:** only the leader of each warp can record events
 ```cpp
 __global__ void my_kernel() {
+    cuprof::Event e;
     if (cuprof::is_warp_leader()) {
-        cuprof::Event compute_id = myprofiler.start_event("compute");
+        e = myprofiler.start_event("compute");
     }    
     // ... work ...
     if (cuprof::is_warp_leader()) {
-        myprofiler.end_event(compute_id);
+        myprofiler.end_event(e);
     }
 }
 ```
@@ -58,7 +59,7 @@ make                           # Build all examples
 ```
 
 Each example generates a trace JSON file that you can view in:
-- **Chrome**: Navigate to `chrome://tracing` and load the file
+- **Chrome**: Navigate to `chrome://tracing` and load the file (spec: https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview?pli=1&tab=t.0#heading=h.jh64i9l3vwa1)
 - **Perfetto**: Open https://ui.perfetto.dev/ and load the file
 
 
