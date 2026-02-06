@@ -15,75 +15,69 @@ namespace cuprof {
 // Forward declaration
 template <int MAX_EVENTS, int MAX_WARPS> struct Profiler;
 
+// Event handle stores all data locally - no gmem writes until end()
+struct Event {
+    const char* section_name;
+    uint64_t start_time_ns;
+    uint64_t end_time_ns;
+};
+
 // Block-wide state containing all per-block profiling data (in global memory)
 template <int MAX_EVENTS = 128, int MAX_WARPS = 32>
 struct BlockState {
-    struct EventData {
-        uint64_t start_time_ns;      // globaltimer nanoseconds (for cross-SM sync)
-        uint64_t start_time_clock;   // clock64 cycles (for precise duration)
-        uint64_t end_time_clock;     // clock64 cycles (for precise duration)
-        const char* section_name;    // Pointer to device constant string
-    };
-
     // Per-warp event storage
-    EventData events[MAX_WARPS][MAX_EVENTS];
+    Event events[MAX_WARPS][MAX_EVENTS];
     int event_counts[MAX_WARPS];  // Number of events recorded per warp
-    
+
     // Per-block data (captured once during block_init)
     unsigned int smid;  // SM ID where this block executes
-    int initialized;
 };
 
 // PTX special register helpers
-__device__ __forceinline__ unsigned int get_laneid() {
+__device__ __forceinline__ unsigned int laneid() {
     unsigned int lane_id;
     asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
     return lane_id;
 }
 
-__device__ __forceinline__ unsigned int get_warpid() {
+__device__ __forceinline__ unsigned int warpid() {
     unsigned int warp_id;
     asm volatile("mov.u32 %0, %%warpid;" : "=r"(warp_id));
     return warp_id;
 }
 
-__device__ __forceinline__ unsigned int get_ctaid_x() {
-    unsigned int cta_id;
-    asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(cta_id));
-    return cta_id;
+__device__ __forceinline__ uint32_t block_idx() {
+    uint32_t idx;
+    asm(
+        "{\n\t"
+        "  // block_idx()\n\t"
+        "  .reg .u32 bx, by, bz, nx, ny;\n\t"
+        "  mov.u32 bx, %%ctaid.x;\n\t"
+        "  mov.u32 by, %%ctaid.y;\n\t"
+        "  mov.u32 bz, %%ctaid.z;\n\t"
+        "  mov.u32 nx, %%nctaid.x;\n\t"
+        "  mov.u32 ny, %%nctaid.y;\n\t"
+        "  mad.lo.u32 %0, bz, ny, by;\n\t"
+        "  mad.lo.u32 %0, %0, nx, bx;\n\t"
+        "}"
+        : "=r"(idx)
+    );
+    return idx;
 }
 
-__device__ __forceinline__ unsigned int get_smid() {
+__device__ __forceinline__ unsigned int smid() {
     unsigned int sm_id;
     asm volatile("mov.u32 %0, %%smid;" : "=r"(sm_id));
     return sm_id;
 }
 
-__device__ __forceinline__ unsigned int get_tid_x() {
-    unsigned int tid;
-    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(tid));
-    return tid;
-}
-
-__device__ __forceinline__ unsigned int get_tid_y() {
-    unsigned int tid;
-    asm volatile("mov.u32 %0, %%tid.y;" : "=r"(tid));
-    return tid;
-}
-
-__device__ __forceinline__ unsigned int get_tid_z() {
-    unsigned int tid;
-    asm volatile("mov.u32 %0, %%tid.z;" : "=r"(tid));
-    return tid;
-}
-
-__device__ __forceinline__ uint64_t get_globaltimer() {
+__device__ __forceinline__ uint64_t globaltimer() {
     uint64_t time;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(time));
     return time;
 }
 
-__device__ __forceinline__ uint64_t get_clock64() {
+__device__ __forceinline__ uint64_t clock64() {
     uint64_t clk;
     asm volatile("mov.u64 %0, %%clock64;" : "=l"(clk));
     return clk;
@@ -91,23 +85,30 @@ __device__ __forceinline__ uint64_t get_clock64() {
 
 // Helper to check if current thread is warp leader
 __device__ __forceinline__ bool is_warp_leader() {
-    return get_laneid() == 0;
+    return laneid() == 0;
 }
 
 // Helper to check if current thread is CTA (block) leader
-__device__ __forceinline__ bool is_cta_leader() {
-    return (get_tid_x() | get_tid_y() | get_tid_z()) == 0;
+__device__ __forceinline__ bool is_block_leader() {
+    uint32_t result;
+    asm(
+        "{\n\t"
+        "  // is_block_leader()\n\t"
+        "  .reg .u32 tx, ty, tz;\n\t"
+        "  mov.u32 tx, %%tid.x;\n\t"
+        "  mov.u32 ty, %%tid.y;\n\t"
+        "  mov.u32 tz, %%tid.z;\n\t"
+        "  or.b32 tx, tx, ty;\n\t"
+        "  or.b32 tx, tx, tz;\n\t"
+        "  set.eq.u32.u32 %0, tx, 0;\n\t"
+        "}"
+        : "=r"(result)
+    );
+    return result;
 }
 
 
-// Event handle stores all data locally - no gmem writes until end()
-struct Event {
-    const char* section_name;
-    uint64_t start_time_ns;
-    uint64_t start_time_clock;
-    
-    __device__ __host__ bool is_valid() const { return section_name != nullptr; }
-};
+
 
 /**
  * @brief Lightweight per-warp profiler for CUDA kernels with Chrome Trace/Perfetto export.
@@ -140,7 +141,7 @@ template <int MAX_EVENTS = 128, int MAX_WARPS = 32>
 struct __align__(16) Profiler {
     // Device pointer to per-block state array
     BlockState<MAX_EVENTS, MAX_WARPS> *block_states;
-    
+
     // Host-side storage for managing memory
     int num_blocks;
 
@@ -149,13 +150,8 @@ struct __align__(16) Profiler {
      * Should be called by one thread (e.g., CTA leader) with a __syncthreads() after.
      */
     __device__ inline void block_init() {
-        unsigned int block_id = get_ctaid_x();
-        BlockState<MAX_EVENTS, MAX_WARPS> &state = block_states[block_id];
-        
-        if (is_cta_leader()) {
-            // Capture SM ID once for entire block
-            state.smid = get_smid();
-            state.initialized = 1;
+        if (is_block_leader()) {
+            block_states[block_idx()].smid = smid(); // Capture SM ID once for entire block
         }
         __syncthreads();
     }
@@ -164,15 +160,13 @@ struct __align__(16) Profiler {
      * @brief Start recording an event section. Call from warp leader only.
      * No gmem writes - all data stored in returned Event handle.
      * @param section_name Pointer to device constant string
-     * @return Event handle to pass to end() 
+     * @return Event handle to pass to end()
      */
     __device__ inline Event start(const char* section_name) {
-        // Capture both globaltimer (for cross-SM sync) and clock64 (for precise duration)
-        Event e;
-        e.section_name = section_name;
-        e.start_time_ns = get_globaltimer();
-        e.start_time_clock = get_clock64();
-        return e;
+        return {
+            .section_name = section_name,
+            .start_time_ns = globaltimer()
+        };
     }
 
     /**
@@ -182,26 +176,17 @@ struct __align__(16) Profiler {
      */
     __device__ inline void end(Event event) {
         // Capture end time FIRST for precise timing
-        uint64_t end_clock = get_clock64();
-        
-        if (!event.is_valid()) return;  // Invalid event
-        
-        unsigned int block_id = get_ctaid_x();
-        BlockState<MAX_EVENTS, MAX_WARPS> &state = block_states[block_id];
-        
-        unsigned int warp_id = get_warpid();
+        uint64_t end_time_ns = globaltimer();
+
+        BlockState<MAX_EVENTS, MAX_WARPS> &block_state = block_states[block_idx()];
+
+        unsigned int warp_id = warpid();
         if (warp_id >= MAX_WARPS) return;
-        
-        // Atomically reserve an index for this event
-        int idx = atomicAdd(&state.event_counts[warp_id], 1);
+
+        int idx = block_state.event_counts[warp_id]++; // no need for an atomic, only one warp leader is supposed to do this
         if (idx >= MAX_EVENTS) return;  // Overflow protection
-        
-        // Write all event data to gmem in one go
-        typename BlockState<MAX_EVENTS, MAX_WARPS>::EventData &evt = state.events[warp_id][idx];
-        evt.start_time_ns = event.start_time_ns;
-        evt.start_time_clock = event.start_time_clock;
-        evt.end_time_clock = end_clock;
-        evt.section_name = event.section_name;
+
+        block_state.events[warp_id][idx] = event;
     }
 
     /**
@@ -211,8 +196,8 @@ struct __align__(16) Profiler {
      * @param filename Output JSON filename
      */
     static inline void export_chrome_trace(
-        const BlockState<MAX_EVENTS, MAX_WARPS> *h_block_states, 
-        int num_blocks, 
+        const BlockState<MAX_EVENTS, MAX_WARPS> *h_block_states,
+        int num_blocks,
         const std::string &filename
     ) {
         std::ofstream out(filename);
@@ -226,7 +211,7 @@ struct __align__(16) Profiler {
             const BlockState<MAX_EVENTS, MAX_WARPS> &state = h_block_states[block];
             for (int warp = 0; warp < MAX_WARPS; warp++) {
                 for (int evt = 0; evt < state.event_counts[warp]; evt++) {
-                    const typename BlockState<MAX_EVENTS, MAX_WARPS>::EventData &event = state.events[warp][evt];
+                    const Event &event = state.events[warp][evt];
                     if (event.section_name != nullptr) {
                         unique_name_ptrs.insert(event.section_name);
                     }
@@ -248,7 +233,7 @@ struct __align__(16) Profiler {
                 len++;
             }
             buffer[len] = '\0';
-            
+
             if (len > 0) {
                 name_map[dev_ptr] = std::string(buffer);
             } else {
@@ -264,84 +249,91 @@ struct __align__(16) Profiler {
         cudaGetDevice(&device);
         int clock_rate_khz;
         cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate, device);
-        
+
         // Find minimum start_time_ns across all events (globaltimer is synchronized across SMs)
         uint64_t global_min_time_ns = UINT64_MAX;
+
+        printf("n blocks: %d\n", num_blocks);
         for (int block = 0; block < num_blocks; block++) {
-            const BlockState<MAX_EVENTS, MAX_WARPS> &state = h_block_states[block];
+            const BlockState<MAX_EVENTS, MAX_WARPS> &block_state = h_block_states[block];
             for (int warp = 0; warp < MAX_WARPS; warp++) {
-                for (int evt = 0; evt < state.event_counts[warp]; evt++) {
-                    const typename BlockState<MAX_EVENTS, MAX_WARPS>::EventData &event = state.events[warp][evt];
+                printf("n events: %d\n", block_state.event_counts[warp]);
+                for (int evt = 0; evt < block_state.event_counts[warp]; evt++) {
+                    const Event &event = block_state.events[warp][evt];
                     if (event.section_name != nullptr && event.start_time_ns > 0) {
+                        printf("globaltimer: %zu\n", event.start_time_ns);
+
                         global_min_time_ns = std::min(global_min_time_ns, event.start_time_ns);
                     }
                 }
             }
         }
-        
+
+
         // If no valid events found, set to 0
         if (global_min_time_ns == UINT64_MAX) {
             global_min_time_ns = 0;
         }
 
         out << "[\n";
-        bool first_event = true;
+        // bool first_event = true;
 
-        for (int block = 0; block < num_blocks; block++) {
-            const BlockState<MAX_EVENTS, MAX_WARPS> &state = h_block_states[block];
+        // printf("n blocks: %d\n", num_blocks);
+        // for (int block = 0; block < num_blocks; block++) {
+        //     const BlockState<MAX_EVENTS, MAX_WARPS> &state = h_block_states[block];
 
-            for (int warp = 0; warp < MAX_WARPS; warp++) {
-                for (int evt = 0; evt < state.event_counts[warp]; evt++) {
-                    const typename BlockState<MAX_EVENTS, MAX_WARPS>::EventData &event = state.events[warp][evt];
-                    if (event.section_name == nullptr) continue;
+        //     for (int warp = 0; warp < MAX_WARPS; warp++) {
+        //         for (int evt = 0; evt < state.event_counts[warp]; evt++) {
+        //             const typename BlockState<MAX_EVENTS, MAX_WARPS>::EventData &event = state.events[warp][evt];
+        //             if (event.section_name == nullptr) continue;
 
-                    // Use globaltimer for timestamp (cross-SM synchronized), clock64 for duration
-                    // Timestamp: globaltimer normalized to minimum (nanoseconds -> microseconds)
-                    double start_us = static_cast<double>(event.start_time_ns - global_min_time_ns) / 1000.0;
-                    
-                    // Use clock64 for precise duration measurement within same SM
-                    // clock_rate_khz is in kHz, so cycles * 1000.0 / clock_rate_khz = microseconds
-                    double duration_us;
-                    if (event.end_time_clock >= event.start_time_clock) {
-                        uint64_t duration_cycles = event.end_time_clock - event.start_time_clock;
-                        duration_us = static_cast<double>(duration_cycles) * 1000.0 / clock_rate_khz;
-                        
-                        // Sanity check: if duration is unreasonably large (>1 second), likely corrupted data
-                        if (duration_us > 1000000.0) {  // > 1 second
-                            duration_us = 0.0;
-                        }
-                    } else {
-                        // clock64 wraparound - should be extremely rare, treat as corrupted
-                        duration_us = 0.0;
-                    }
+        //             // Use globaltimer for timestamp (cross-SM synchronized), clock64 for duration
+        //             // Timestamp: globaltimer normalized to minimum (nanoseconds -> microseconds)
+        //             double start_us = static_cast<double>(event.start_time_ns - global_min_time_ns) / 1000.0;
 
-                    if (!first_event) {
-                        out << ",\n";
-                    }
-                    first_event = false;
+        //             // Use clock64 for precise duration measurement within same SM
+        //             // clock_rate_khz is in kHz, so cycles * 1000.0 / clock_rate_khz = microseconds
+        //             double duration_us;
+        //             if (event.end_time_clock >= event.start_time_clock) {
+        //                 uint64_t duration_cycles = event.end_time_clock - event.start_time_clock;
+        //                 duration_us = static_cast<double>(duration_cycles) * 1000.0 / clock_rate_khz;
 
-                    // Get the section name
-                    std::string section_name = name_map[event.section_name];
+        //                 // Sanity check: if duration is unreasonably large (>1 second), likely corrupted data
+        //                 if (duration_us > 1000000.0) {  // > 1 second
+        //                     duration_us = 0.0;
+        //                 }
+        //             } else {
+        //                 // clock64 wraparound - should be extremely rare, treat as corrupted
+        //                 duration_us = 0.0;
+        //             }
 
-                    // Chrome Trace Event Format
-                    out << "  {\n";
-                    out << "    \"name\": \"" << section_name << "\",\n";
-                    out << "    \"cat\": \"kernel\",\n";
-                    out << "    \"ph\": \"X\",\n";  // Complete event (duration)
-                    // Compute global warp ID: block_id * warps_per_block + local_warp_id
-                    int global_warp_id = block * MAX_WARPS + warp;
-                    
-                    out << "    \"ts\": " << std::fixed << std::setprecision(6) << start_us << ",\n";
-                    out << "    \"dur\": " << std::fixed << std::setprecision(6) << duration_us << ",\n";
-                    out << "    \"pid\": " << state.smid << ",\n";  // Process = SM ID
-                    out << "    \"tid\": " << global_warp_id << ",\n";   // Thread = global warp ID
-                    out << "    \"args\": {\"block\": " << block << ", \"warp\": " << warp << ", \"smid\": " << state.smid << "}\n";
-                    out << "  }";
-                }
-            }
-        }
+        //             if (!first_event) {
+        //                 out << ",\n";
+        //             }
+        //             first_event = false;
 
-        out << "\n]\n";
+        //             // Get the section name
+        //             std::string section_name = name_map[event.section_name];
+
+        //             // Chrome Trace Event Format
+        //             out << "  {\n";
+        //             out << "    \"name\": \"" << section_name << "\",\n";
+        //             out << "    \"cat\": \"kernel\",\n";
+        //             out << "    \"ph\": \"X\",\n";  // Complete event (duration)
+        //             // Compute global warp ID: block_id * warps_per_block + local_warp_id
+        //             int global_warp_id = block * MAX_WARPS + warp;
+
+        //             out << "    \"ts\": " << std::fixed << std::setprecision(6) << start_us << ",\n";
+        //             out << "    \"dur\": " << std::fixed << std::setprecision(6) << duration_us << ",\n";
+        //             out << "    \"pid\": " << state.smid << ",\n";  // Process = SM ID
+        //             out << "    \"tid\": " << global_warp_id << ",\n";   // Thread = global warp ID
+        //             out << "    \"args\": {\"block\": " << block << ", \"warp\": " << warp << ", \"smid\": " << state.smid << "}\n";
+        //             out << "  }";
+        //         }
+        //     }
+        // }
+
+        // out << "\n]\n";
         out.close();
     }
 };
@@ -355,11 +347,11 @@ template <int MAX_EVENTS, int MAX_WARPS>
 inline void init(Profiler<MAX_EVENTS, MAX_WARPS> *profiler, int num_blocks) {
     Profiler<MAX_EVENTS, MAX_WARPS> h_profiler;
     h_profiler.num_blocks = num_blocks;
-    
+
     // Allocate device memory for per-block state array
     cudaMalloc(&h_profiler.block_states, num_blocks * sizeof(BlockState<MAX_EVENTS, MAX_WARPS>));
     cudaMemset(h_profiler.block_states, 0, num_blocks * sizeof(BlockState<MAX_EVENTS, MAX_WARPS>));
-    
+
     // Copy the profiler struct to the __device__ global
     cudaMemcpyToSymbol(*profiler, &h_profiler, sizeof(Profiler<MAX_EVENTS, MAX_WARPS>));
 }
@@ -377,22 +369,22 @@ inline void export_and_cleanup(
     // Copy profiler struct from device to host
     Profiler<MAX_EVENTS, MAX_WARPS> h_profiler;
     cudaMemcpyFromSymbol(&h_profiler, *profiler, sizeof(Profiler<MAX_EVENTS, MAX_WARPS>));
-    
+
     if (!h_profiler.block_states) return;
-    
+
     // Copy per-block state from device to host
-    BlockState<MAX_EVENTS, MAX_WARPS> *h_block_states = 
+    BlockState<MAX_EVENTS, MAX_WARPS> *h_block_states =
         new BlockState<MAX_EVENTS, MAX_WARPS>[h_profiler.num_blocks];
-    cudaMemcpy(h_block_states, h_profiler.block_states, 
-               h_profiler.num_blocks * sizeof(BlockState<MAX_EVENTS, MAX_WARPS>), 
+    cudaMemcpy(h_block_states, h_profiler.block_states,
+               h_profiler.num_blocks * sizeof(BlockState<MAX_EVENTS, MAX_WARPS>),
                cudaMemcpyDeviceToHost);
-    
+
     // Export if filename provided
     if (!filename.empty()) {
         Profiler<MAX_EVENTS, MAX_WARPS>::export_chrome_trace(
             h_block_states, h_profiler.num_blocks, filename);
     }
-    
+
     // Cleanup
     delete[] h_block_states;
     cudaFree(h_profiler.block_states);
