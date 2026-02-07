@@ -50,6 +50,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
             int m = block_m * BM + a_row;
             int k = block_k * BK + a_col;
             rA = A[m * K + k];
+            __syncthreads();
         }
         if (is_warp_leader) myprofiler.end(load_a_id);
 
@@ -60,6 +61,7 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
             int k = block_k * BK + b_row;
             int n = block_n * BN + b_col;
             rB = B[k * N + n];
+            __syncthreads();
         }
         if (is_warp_leader) myprofiler.end(load_b_id);
 
@@ -92,9 +94,9 @@ __global__ void dgemm_kernel_tnt(int M, int N, int K,
 
 int main() {
     // init problem size
-    int M = 256;
-    int N = 256;
-    int K = 256;
+    int M = 128;
+    int N = 128;
+    int K = 128;
 
     // Calculate grid size
     dim3 grid_size(M / BM, N / BN);
@@ -144,6 +146,7 @@ int main() {
     printf("%f GFlops\n", gflop / s);
 
     // Export profiler data
+    printf("Generating profiler trace..\n");
     cuprof::export_and_cleanup(&myprofiler, "trace.json");
     printf("Profiler trace exported to trace.json\n");
 
