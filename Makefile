@@ -1,5 +1,5 @@
 NVCC = nvcc
-NVCCFLAGS = -arch=sm_89 -I.
+NVCCFLAGS = -arch=sm_89 -I. -lcupti
 
 all: dgemm_example multi_warp_example nested_events_example flash_attention_example
 
